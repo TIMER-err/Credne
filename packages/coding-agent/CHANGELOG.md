@@ -4,6 +4,9 @@
 
 ### Added
 
+* Added OpenAI API key accounts through `/account add openai-api-key`. They use the official OpenAI API and `pool:openai`, separately from Codex subscription login.
+* Added `search_models` for configured model discovery on the current serving account, including exact IDs, names, reasoning levels, costs, and paginated results. Subagent and planning selections accept bare IDs and unique names such as `luna`; switching accounts requires an explicit provider/model route. See [Subagents](docs/subagents.md#finding-models).
+* Added the Credne account broker, planning workflow, and bundled subagents used by model discovery and worker account selection. See [Multiple Accounts](docs/accounts.md) and [Subagents](docs/subagents.md).
 - Added `deepseek-v4.1-flash` and `deepseek-v4.1-flash-1017` to the Qwen Token Plan Individual providers, and per-plan key variables `QWEN_TOKEN_PLAN_TEAM_API_KEY`, `QWEN_TOKEN_PLAN_TEAM_CN_API_KEY`, `QWEN_TOKEN_PLAN_INDIVIDUAL_API_KEY`, and `QWEN_TOKEN_PLAN_INDIVIDUAL_CN_API_KEY`; the shared `QWEN_TOKEN_PLAN_API_KEY` and `QWEN_TOKEN_PLAN_CN_API_KEY` still work ([#11773](https://github.com/earendil-works/pi/issues/11773))
 
 ### Changed
