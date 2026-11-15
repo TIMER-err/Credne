@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { transformMessages } from "../src/api/transform-messages.ts";
+import { REASONING_SUMMARY_LABEL, transformMessages } from "../src/api/transform-messages.ts";
 import type { AssistantMessage, Message, Model } from "../src/types.ts";
 
 const kimi: Model<"openai-completions"> = {
@@ -35,9 +35,11 @@ function assistant(model: string, content: AssistantMessage["content"]): Assista
 	};
 }
 
+const summary = (text: string) => ({ type: "text" as const, text: `${REASONING_SUMMARY_LABEL}\n${text}` });
+
 describe("thinking from other models", () => {
-	// https://github.com/earendil-works/pi/issues/10995
-	it("does not send another model's readable thinking as text", () => {
+	// https://github.com/earendil-works/pi/issues/10995: unlabeled thinking was continued as the visible reply
+	it("replaces another model's thinking with a labeled summary", () => {
 		const messages: Message[] = [
 			{ role: "user", content: "Why does curl work but node fails?", timestamp: Date.now() },
 			assistant("zai-org/GLM-5.3", [
@@ -63,9 +65,32 @@ describe("thinking from other models", () => {
 		const assistantMsg = result.find((m) => m.role === "assistant") as AssistantMessage;
 
 		expect(assistantMsg.content).toEqual([
+			summary("The user asks about ECONNRESET. Candidates: proxy, IPv6, TLS."),
 			{ type: "text", text: "Let me check the TLS versions." },
 			{ type: "toolCall", id: "call_1", name: "bash", arguments: { command: "curl -v" } },
 		]);
+	});
+
+	it("drops redacted and empty thinking and bounds long summaries", () => {
+		const long = "x".repeat(5000);
+		const messages: Message[] = [
+			{ role: "user", content: "go", timestamp: Date.now() },
+			{
+				...assistant("zai-org/GLM-5.3", [
+					{ type: "thinking", thinking: "", thinkingSignature: "opaque", redacted: true },
+					{ type: "thinking", thinking: "   ", thinkingSignature: "sig" },
+					{ type: "thinking", thinking: long, thinkingSignature: "sig" },
+					{ type: "text", text: "ok" },
+				]),
+				stopReason: "stop",
+			},
+			{ role: "user", content: "next", timestamp: Date.now() },
+		];
+		const assistantMsg = transformMessages(messages, kimi).find((m) => m.role === "assistant") as AssistantMessage;
+		const [first, second] = assistantMsg.content;
+		expect(first).toEqual({ type: "text", text: expect.stringMatching(/^\[Reasoning summary[\s\S]*x …$/) });
+		expect((first as { text: string }).text.length).toBeLessThan(1600);
+		expect(second).toEqual({ type: "text", text: "ok" });
 	});
 
 	it("keeps thinking only from the target model when models alternate", () => {
@@ -91,9 +116,9 @@ describe("thinking from other models", () => {
 
 		expect(contents).toEqual([
 			[thinking("kimi 1"), { type: "text", text: "a" }],
-			[{ type: "text", text: "b" }],
+			[summary("glm 1"), { type: "text", text: "b" }],
 			[thinking("kimi 2"), { type: "text", text: "c" }],
-			[{ type: "text", text: "d" }],
+			[summary("glm 2"), { type: "text", text: "d" }],
 		]);
 	});
 });

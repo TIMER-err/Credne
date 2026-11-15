@@ -33,7 +33,12 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { isMcpServerOverride, mcpNamespace } from "@earendil-works/pi-mcp";
 import { CONFIG_DIR_NAME } from "../../config.ts";
-import { type McpExposure, type McpServerConfig, validateMcpServerConfig } from "../../core/mcp-servers.ts";
+import {
+	DEFAULT_MCP_EXPOSURE,
+	type McpExposure,
+	type McpServerConfig,
+	validateMcpServerConfig,
+} from "../../core/mcp-servers.ts";
 import { stripBom } from "../../utils/text.ts";
 
 export type {
@@ -43,7 +48,7 @@ export type {
 	McpServerConfig,
 	McpStdioServerConfig,
 } from "../../core/mcp-servers.ts";
-export { getMcpToolExposure } from "../../core/mcp-servers.ts";
+export { DEFAULT_MCP_EXPOSURE, getMcpToolExposure } from "../../core/mcp-servers.ts";
 
 export interface McpServerEntry {
 	name: string;
@@ -147,7 +152,7 @@ export function loadMcpConfig(options: { agentDir: string; cwd: string; projectT
 	};
 }
 
-/** Settings `/mcp` changes. `enabled: true` and `exposure: "codemode"` are the defaults and remove the key. */
+/** Settings `/mcp` changes. `enabled: true` and the default exposure are the defaults and remove the key. */
 export interface McpServerConfigPatch {
 	enabled?: boolean;
 	exposure?: McpExposure;
@@ -177,7 +182,7 @@ export function updateMcpServerConfig(
 			else server.enabled = patch.enabled;
 		}
 		if (patch.exposure !== undefined) {
-			if (patch.exposure === "codemode" && !keepDefaults) delete server.exposure;
+			if (patch.exposure === DEFAULT_MCP_EXPOSURE && !keepDefaults) delete server.exposure;
 			else server.exposure = patch.exposure;
 		}
 		return true;

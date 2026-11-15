@@ -60,6 +60,9 @@ export function isMcpToolName(name: string): boolean {
  */
 export type McpExposure = "codemode" | "deferred" | "direct" | "hidden";
 
+/** Exposure of servers and tools whose config sets none: the model finds them with `tool_search`. */
+export const DEFAULT_MCP_EXPOSURE: McpExposure = "deferred";
+
 const MCP_EXPOSURES: readonly string[] = ["codemode", "deferred", "direct", "hidden"] satisfies McpExposure[];
 
 /** Older exposure names, accepted in configs and replaced by their current name when validated. */
@@ -70,7 +73,7 @@ const MCP_EXPOSURE_ALIASES: Readonly<Record<string, McpExposure>> = { "codemode-
  * and `timeout` are shared fields, declared again for pi's documentation.
  */
 interface McpServerConfigBase {
-	/** Default: `codemode`. */
+	/** Default: `deferred`. */
 	exposure?: McpExposure;
 	/**
 	 * What the server offers, in a sentence. The `mcp_servers` system prompt section lists the server
@@ -174,7 +177,7 @@ export function getMcpToolExposure(config: McpServerConfig, toolName: string): M
 	for (const [pattern, exposure] of Object.entries(overrides)) {
 		if (pattern.includes("*") && toolPatternRegExp(pattern).test(toolName)) return exposure;
 	}
-	return config.exposure ?? "codemode";
+	return config.exposure ?? DEFAULT_MCP_EXPOSURE;
 }
 
 /** Checks `exposure` and `toolExposure`, after aliases were resolved. Returns an error message. */

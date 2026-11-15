@@ -169,6 +169,10 @@
           "path": "providers.md"
         },
         {
+          "title": "Multiple Accounts",
+          "path": "accounts.md"
+        },
+        {
           "title": "Session File Format",
           "path": "session-format.md"
         },

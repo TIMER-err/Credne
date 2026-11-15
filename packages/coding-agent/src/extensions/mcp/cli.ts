@@ -16,6 +16,7 @@ import { openBrowser } from "../../utils/open-browser.ts";
 import { questionTerminal } from "../../utils/terminal-question.ts";
 import {
 	addMcpServerConfig,
+	DEFAULT_MCP_EXPOSURE,
 	getMcpToolExposure,
 	type LoadedMcpConfig,
 	loadMcpConfig,
@@ -68,7 +69,7 @@ Options for add:
                           Client name sent when registering with the OAuth server
   --oauth-client-registration <mode>
                           auto (default), cimd, or dcr
-  --exposure <mode>       codemode (default), deferred, direct, or hidden
+  --exposure <mode>       deferred (default), codemode, direct, or hidden
   --description <text>    What the server offers, shown in the system prompt
 
 Other options:
@@ -525,7 +526,7 @@ async function list(
 				source: entry.source,
 				...(entry.override ? { override: entry.override } : {}),
 				enabled: entry.config.enabled !== false,
-				exposure: entry.config.exposure ?? "codemode",
+				exposure: entry.config.exposure ?? DEFAULT_MCP_EXPOSURE,
 				transport: describeTransport(entry),
 				...(authProvider ? { authProvider } : {}),
 				state: "disabled",

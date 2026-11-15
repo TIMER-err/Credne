@@ -1937,9 +1937,9 @@ Typical `sourceInfo` values:
 
 `pi.setActiveTools()` ignores unknown and `hidden` tools. Tools with `codemode` or `deferred` exposure stay callable from codemode scripts whether active or not.
 
-### pi.setModel(model)
+### pi.setModel(model, options?)
 
-Set the model for the current session. The change is recorded in session history and restored when that session is resumed, but it does not change the configured `defaultProvider` or `defaultModel` used by new sessions. Returns `false` if authentication is not configured for the model's provider. See [models.md](models.md) for configuring custom models.
+Set the model for the current session. The change is recorded in session history and restored when that session is resumed. By default it does not change the configured `defaultProvider` or `defaultModel` used by new sessions; pass `{ persist: true }` to save it as that default, as choosing it in `/model` does. Returns `false` if authentication is not configured for the model's provider. See [models.md](models.md) for configuring custom models.
 
 ```typescript
 const model = ctx.modelRegistry.find("anthropic", "claude-sonnet-4-5");

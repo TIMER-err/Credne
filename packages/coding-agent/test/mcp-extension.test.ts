@@ -255,10 +255,36 @@ describe("MCP config", () => {
 		expect(getMcpToolExposure(config, "get_delete_hint")).toBe("codemode");
 		expect(getMcpToolExposure(config, "delete_repo")).toBe("hidden");
 		expect(getMcpToolExposure(config, "list_issues")).toBe("deferred");
-		// Only `*` is special.
-		expect(getMcpToolExposure({ command: "x", toolExposure: { "get_file.*": "direct" } }, "get_file_x")).toBe(
-			"codemode",
-		);
+		// Only `*` is special; other names take the server's exposure.
+		expect(
+			getMcpToolExposure(
+				{ command: "x", exposure: "codemode", toolExposure: { "get_file.*": "direct" } },
+				"get_file_x",
+			),
+		).toBe("codemode");
+	});
+
+	it("defaults servers and tools without exposure to deferred", () => {
+		expect(getMcpToolExposure({ command: "x" }, "any_tool")).toBe("deferred");
+		expect(getMcpToolExposure({ command: "x", toolExposure: { "get_*": "direct" } }, "list_files")).toBe("deferred");
+		expect(getMcpToolExposure({ command: "x", exposure: "codemode" }, "any_tool")).toBe("codemode");
+	});
+
+	it("saves the default exposure by removing the key and other exposures by writing them", () => {
+		const paths = setup({ mcpServers: { tools: { command: "x", exposure: "codemode" } } }, {});
+		const global = join(paths.agentDir, "mcp.json");
+		const tools = () => JSON.parse(readFileSync(global, "utf8")).mcpServers.tools;
+
+		updateMcpServerConfig(global, "tools", { exposure: "deferred" });
+		expect(tools()).toEqual({ command: "x" });
+		updateMcpServerConfig(global, "tools", { exposure: "codemode" });
+		expect(tools()).toEqual({ command: "x", exposure: "codemode" });
+
+		// Overrides keep the default, since it replaces the global value.
+		const project = join(paths.cwd, ".pi", "mcp.json");
+		writeFileSync(project, JSON.stringify({ mcpServers: { tools: { exposure: "codemode" } } }));
+		updateMcpServerConfig(project, "tools", { exposure: "deferred" });
+		expect(JSON.parse(readFileSync(project, "utf8")).mcpServers.tools).toEqual({ exposure: "deferred" });
 	});
 
 	it("validates provider auth and accepts it only in the global mcp.json", () => {
@@ -824,17 +850,30 @@ describe("MCP servers section", () => {
 
 	it("lists servers with how their tools are reached and the first line of their description", () => {
 		const section = renderServersSection([
+			// Without `exposure`, a server is deferred: its tools are found with tool_search.
 			server("docs", "Docs search.\nMore."),
 			server("later", undefined, "deferred"),
+			server("scripts", undefined, "codemode"),
 			server("direct", "Declared.", "direct"),
 			{ entry: server("plain").entry, connection: { instructions: "From instructions." } },
 		]);
 		expect(section?.split("\n").slice(1)).toEqual([
-			"- mcp__docs (codemode): Docs search.",
+			"- mcp__docs (tool_search): Docs search.",
 			"- mcp__later (tool_search)",
-			"- mcp__plain (codemode): From instructions.",
+			"- mcp__plain (tool_search): From instructions.",
+			"- mcp__scripts (codemode)",
 		]);
 		expect(renderServersSection([server("direct", "Declared.", "direct")])).toBeUndefined();
+	});
+
+	it("explains only the ways of reaching tools that the listed servers use", () => {
+		const intro = (...servers: ReturnType<typeof server>[]) => renderServersSection(servers)?.split("\n")[0];
+		expect(intro(server("docs"))).toBe(
+			"MCP servers whose tools are not declared to you. Load the tools of `tool_search` servers with `tool_search`.",
+		);
+		expect(intro(server("docs", undefined, "codemode"))).toBe(
+			"MCP servers whose tools are not declared to you. Call the tools of `codemode` servers from codemode scripts.",
+		);
 	});
 
 	it("shortens descriptions to fit the size limit", () => {
@@ -842,7 +881,7 @@ describe("MCP servers section", () => {
 		const section = renderServersSection(servers) ?? "";
 		expect(section.length).toBeLessThanOrEqual(MAX_SERVERS_SECTION_CHARS);
 		expect(section.split("\n")).toHaveLength(41);
-		expect(section).toContain("- mcp__server39 (codemode): x");
+		expect(section).toContain("- mcp__server39 (tool_search): x");
 	});
 
 	it("leaves out the last servers when their names alone do not fit", () => {
@@ -850,8 +889,22 @@ describe("MCP servers section", () => {
 		const section = renderServersSection(servers) ?? "";
 		expect(section.length).toBeLessThanOrEqual(MAX_SERVERS_SECTION_CHARS);
 		const lines = section.split("\n");
-		expect(lines.at(-1)).toMatch(/^- … \d+ more servers; find their tools with searchTools\(\)$/);
+		expect(lines.at(-1)).toMatch(/^- … \d+ more servers; find their tools with tool_search$/);
 		const omitted = Number(/(\d+) more/.exec(lines.at(-1) ?? "")?.[1]);
 		expect(lines.length - 2 + omitted).toBe(200);
+	});
+
+	it("names how to find the tools of the servers it leaves out", () => {
+		const lastLine = (exposure: (index: number) => "codemode" | "deferred") => {
+			const servers = Array.from({ length: 200 }, (_, index) =>
+				server(`server-with-a-long-name-${String(index).padStart(3, "0")}`, undefined, exposure(index)),
+			);
+			return renderServersSection(servers)?.split("\n").at(-1);
+		};
+		expect(lastLine(() => "codemode")).toMatch(/find their tools with searchTools\(\)$/);
+		expect(lastLine(() => "deferred")).toMatch(/find their tools with tool_search$/);
+		expect(lastLine((index) => (index % 2 === 0 ? "codemode" : "deferred"))).toMatch(
+			/find their tools with searchTools\(\) or tool_search$/,
+		);
 	});
 });

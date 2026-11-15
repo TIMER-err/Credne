@@ -47,12 +47,12 @@ describe("pi mcp", () => {
 	it("lists servers with their state, tools, and errors, and fails while anything is wrong", async () => {
 		const { exitCode, output } = await run(["list"], servers);
 		expect(exitCode).toBe(1);
-		expect(output).toContain("fixture: connected, 1 tool (codemode, global)\n");
+		expect(output).toContain("fixture: connected, 1 tool (deferred, global)\n");
 		expect(output).toContain("  tools: echo");
 		expect(output).toContain(
-			"broken: failed (codemode, global)\n  pi-test-missing-mcp-server\n  spawn pi-test-missing-mcp-server ENOENT",
+			"broken: failed (deferred, global)\n  pi-test-missing-mcp-server\n  spawn pi-test-missing-mcp-server ENOENT",
 		);
-		expect(output).toContain("parked: disabled (codemode, global)");
+		expect(output).toContain("parked: disabled (deferred, global)");
 		expect(output).toContain("config error: ");
 		expect(output).toContain('server "bad" needs either "command"');
 
@@ -68,6 +68,22 @@ describe("pi mcp", () => {
 			{ name: "fixture", state: "connected", tools: ["echo"] },
 			{ name: "parked", state: "disabled", tools: [] },
 		]);
+	});
+
+	it("reports servers without exposure as deferred and keeps an explicit exposure", async () => {
+		const { exitCode, output } = await run(["list", "--json"], {
+			fixture: servers.fixture,
+			scripts: { ...servers.fixture, exposure: "codemode" },
+		});
+		expect(exitCode).toBe(0);
+		const parsed = JSON.parse(output) as { servers: { name: string; exposure: string }[] };
+		expect(parsed.servers.map(({ name, exposure }) => ({ name, exposure }))).toEqual([
+			{ name: "fixture", exposure: "deferred" },
+			{ name: "scripts", exposure: "codemode" },
+		]);
+
+		const help = await run(["--help"], undefined);
+		expect(help.output).toContain("--exposure <mode>       deferred (default), codemode, direct, or hidden");
 	});
 
 	it("rejects unknown servers and servers without OAuth for login and logout", async () => {
@@ -104,7 +120,7 @@ describe("pi mcp", () => {
 			// Without the provider's credentials the hint names the provider's /login, not `pi mcp login`.
 			const signedOut = await run(["list"], radius, undefined, async () => undefined);
 			expect(signedOut.exitCode).toBe(1);
-			expect(signedOut.output).toContain("radius: needs sign-in (codemode, global)");
+			expect(signedOut.output).toContain("radius: needs sign-in (deferred, global)");
 			expect(signedOut.output).toContain("  sign in with: /login radius in pi");
 
 			for (const command of ["login", "logout"]) {

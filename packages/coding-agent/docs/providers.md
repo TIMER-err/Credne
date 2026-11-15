@@ -17,6 +17,8 @@ Run `/logout` and select a provider to remove its stored credential. This does n
 
 `auth.json` can contain API keys and OAuth tokens. Keep it private and do not commit it.
 
+`/login` stores one credential per provider. To use several accounts of the same provider and pick one per session, see [Multiple Accounts](accounts.md).
+
 ## Use an API key from the environment
 
 Environment variables are useful in CI and anywhere Pi should not store the key. Set the variable before starting Pi:

@@ -6,13 +6,13 @@
  * in `mcp.json` takes precedence over a registered server of the same name. Connections run in the
  * background: the first prompt waits only for servers with `direct` tools, and codemode scripts,
  * `tool_search`, and the resource tools wait for the servers they need when they run. Tools are
- * registered as `mcp__<server>__<tool>`. By default (`"exposure": "codemode"`) the tools are only
- * callable from codemode scripts, which keeps MCP tools out of the model's tool declarations and
- * the codemode description: scripts find the tools with `searchTools()` and the server instructions
- * with `describeNamespace()`. The codemode tool is activated for that unless `autoEnableCodemode` is
- * false. `"deferred"` declares the tools to the model once the `tool_search` tool loads them, and
- * activates `tool_search` instead of codemode.
- * `"exposure": "direct"` declares them to the model right away, and `"hidden"` makes them
+ * registered as `mcp__<server>__<tool>`. By default (`"exposure": "deferred"`) the tools are not
+ * declared to the model until it loads them with the `tool_search` tool, which is activated for
+ * them, so MCP tools stay out of the model's tool declarations. `"exposure": "codemode"` makes the
+ * tools callable only from codemode scripts, which keeps them out of the codemode description too:
+ * scripts find the tools with `searchTools()` and the server instructions with
+ * `describeNamespace()`. The codemode tool is activated for that unless `autoEnableCodemode` is
+ * false. `"exposure": "direct"` declares them to the model right away, and `"hidden"` makes them
  * unreachable. `toolExposure` overrides the exposure of single tools. Servers with resources are
  * reached through Codex's `list_mcp_resources`, `list_mcp_resource_templates`, and
  * `read_mcp_resource` tools (resources.ts).
@@ -44,6 +44,7 @@ import { openBrowser } from "../../utils/open-browser.ts";
 import { CODEMODE_TOOL_NAME } from "../codemode/tool.ts";
 import { TOOL_SEARCH_TOOL_NAME } from "../tool-search/tool.ts";
 import {
+	DEFAULT_MCP_EXPOSURE,
 	getMcpToolExposure,
 	type LoadedMcpConfig,
 	loadMcpConfig,
@@ -134,7 +135,7 @@ function isEnabled(server: Pick<McpServer, "entry">): boolean {
 }
 
 function exposureOf(entry: McpServerEntry): McpExposure {
-	return entry.config.exposure ?? "codemode";
+	return entry.config.exposure ?? DEFAULT_MCP_EXPOSURE;
 }
 
 /** Exposures the server's tools can have, known from its config before it connects. */
@@ -182,6 +183,9 @@ export interface McpServerListing {
 	connection?: { instructions?: string };
 }
 
+/** How the model finds the tools of servers reached each way, in the order the omission line names them. */
+const TOOL_FINDERS = { codemode: "searchTools()", tool_search: "tool_search" };
+
 /**
  * The `mcp_servers` section: every enabled server with codemode or deferred tools, with how its
  * tools are reached and a one-line summary. The model learns of the servers from it, since neither
@@ -197,10 +201,18 @@ export function renderServersSection(servers: readonly McpServerListing[]): stri
 	);
 	const intro = serversSectionIntro(new Set(reaches));
 	const heads = listed.map((server, index) => `- ${mcpNamespace(server.entry.name)} (${reaches[index]})`);
-	const omitted = (count: number) =>
-		count > 0 ? [`- … ${count} more server${count === 1 ? "" : "s"}; find their tools with searchTools()`] : [];
+	// The line for the servers after the first `kept`, naming how to find the tools of each kind.
+	const omitted = (kept: number) => {
+		const count = listed.length - kept;
+		if (count === 0) return [];
+		const left = new Set<string>(reaches.slice(kept));
+		const finders = Object.entries(TOOL_FINDERS)
+			.filter(([reach]) => left.has(reach))
+			.map(([, finder]) => finder);
+		return [`- … ${count} more server${count === 1 ? "" : "s"}; find their tools with ${finders.join(" or ")}`];
+	};
 	// Characters of the intro, the first `kept` server lines without descriptions, and the omission line.
-	const size = (kept: number) => [intro, ...heads.slice(0, kept), ...omitted(listed.length - kept)].join("\n").length;
+	const size = (kept: number) => [intro, ...heads.slice(0, kept), ...omitted(kept)].join("\n").length;
 	let kept = listed.length;
 	while (kept > 0 && size(kept) > MAX_SERVERS_SECTION_CHARS) kept--;
 	// Each description also takes a ": " separator.
@@ -215,7 +227,7 @@ export function renderServersSection(servers: readonly McpServerListing[]): stri
 				: "";
 		return summary ? `${heads[index]}: ${summary}` : heads[index];
 	});
-	return [intro, ...lines, ...omitted(listed.length - kept)].join("\n");
+	return [intro, ...lines, ...omitted(kept)].join("\n");
 }
 
 /**
@@ -276,6 +288,9 @@ const MCP_USAGE = "Usage: /mcp, /mcp login [server], /mcp logout [server], /mcp 
 
 export function createMcpExtension(options: McpExtensionOptions = {}): ExtensionFactory {
 	return (pi: ExtensionAPI) => {
+		// Workers share a fixed initial tool list and discover every visible MCP tool through tool_search.
+		const requestExposure = (exposure: McpExposure): McpExposure =>
+			process.env.PI_SUBAGENT_WORKER_ID && exposure !== "hidden" ? "deferred" : exposure;
 		let servers: McpServer[] = [];
 		/** Servers from `mcp.json`, which take precedence over registered servers of the same name. */
 		let configuredEntries: McpServerEntry[] = [];
@@ -418,7 +433,7 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 					server,
 					tool,
 					name: assignName(tool.name, `${server}\0${tool.name}`),
-					exposure: getMcpToolExposure(entry.config, tool.name),
+					exposure: requestExposure(getMcpToolExposure(entry.config, tool.name)),
 					namespace,
 					timeoutMs: connection.timeoutMs,
 					getClient: async () => {
@@ -478,7 +493,7 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 		const syncResourceTools = () => {
 			const exposures = new Set(serversWithResources().map((server) => exposureOf(server.entry)));
 			const exposure = (["direct", "codemode", "deferred"] as const).find((candidate) => exposures.has(candidate));
-			const next = exposure ?? "hidden";
+			const next = requestExposure(exposure ?? "hidden");
 			if (next === resourceToolsExposure || (resourceToolsExposure === undefined && next === "hidden")) return;
 			const wasDirect = resourceToolsExposure === "direct";
 			resourceToolsExposure = next;
@@ -501,7 +516,8 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 			// their server's exposure.
 			const exposures = new Set<McpExposure>();
 			for (const server of servers) {
-				if (isEnabled(server)) for (const exposure of configuredExposures(server.entry)) exposures.add(exposure);
+				if (isEnabled(server))
+					for (const exposure of configuredExposures(server.entry)) exposures.add(requestExposure(exposure));
 			}
 			const needsCodemode = exposures.has("codemode");
 			const needsToolSearch = exposures.has("deferred");
@@ -1154,6 +1170,7 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 		const waitForDirectServers = async (ctx: ExtensionContext) => {
 			if (waitedForStartup) return;
 			waitedForStartup = true;
+			if (process.env.PI_SUBAGENT_WORKER_ID) return;
 			const ready = servers.flatMap((server) =>
 				isEnabled(server) && hasDirectTools(server.entry) && server.ready ? [server.ready] : [],
 			);

@@ -124,7 +124,8 @@ describe("AgentSession MCP integration", () => {
 	});
 
 	async function setup(
-		exposure: McpExposure,
+		/** Undefined leaves `exposure` out of the server's config. */
+		exposure: McpExposure | undefined,
 		listTools?: () => unknown[],
 		options: {
 			autoEnableCodemode?: boolean;
@@ -165,7 +166,7 @@ describe("AgentSession MCP integration", () => {
 			name: "docs",
 			config: {
 				url: "http://unused.invalid",
-				exposure,
+				...(exposure ? { exposure } : {}),
 				...(toolExposure ? { toolExposure } : {}),
 				...(description ? { description } : {}),
 			},
@@ -767,7 +768,7 @@ return { docs, sameForAliases: aliases.every((alias) => JSON.stringify(alias) ==
 
 	it("does not hold the first prompt for codemode servers that are still connecting", async () => {
 		// The server never answers `initialize`.
-		const { harness } = await setupSlow({}, Number.POSITIVE_INFINITY);
+		const { harness } = await setupSlow({ exposure: "codemode" }, Number.POSITIVE_INFINITY);
 		harness.setResponses([fauxAssistantMessage("ready")]);
 
 		await harness.session.prompt("start");
@@ -778,7 +779,7 @@ return { docs, sameForAliases: aliases.every((alias) => JSON.stringify(alias) ==
 	});
 
 	it("keeps the codemode description unchanged when the server connects", async () => {
-		const { harness } = await setupSlow({}, 20);
+		const { harness } = await setupSlow({ exposure: "codemode" }, 20);
 		const description = () => harness.session.agent.state.tools.find((tool) => tool.name === "codemode")?.description;
 		const before = description();
 		expect(before).toBeDefined();
@@ -787,7 +788,7 @@ return { docs, sameForAliases: aliases.every((alias) => JSON.stringify(alias) ==
 	});
 
 	it("lists a server before it connects and appends its summary with the next prompt", async () => {
-		const { harness } = await setupSlow({ instructions: "Slow docs.\nMore." }, 30);
+		const { harness } = await setupSlow({ exposure: "codemode", instructions: "Slow docs.\nMore." }, 30);
 		harness.setResponses([fauxAssistantMessage("one"), fauxAssistantMessage("two")]);
 
 		await harness.session.prompt("first");
@@ -830,7 +831,7 @@ return { docs, sameForAliases: aliases.every((alias) => JSON.stringify(alias) ==
 	});
 
 	it("waits for the servers a codemode script names", async () => {
-		const { harness, calls } = await setupSlow({}, 30);
+		const { harness, calls } = await setupSlow({ exposure: "codemode" }, 30);
 		harness.setResponses([
 			fauxAssistantMessage(
 				[
@@ -852,7 +853,7 @@ return { docs, sameForAliases: aliases.every((alias) => JSON.stringify(alias) ==
 	});
 
 	it("waits for servers whose script identifiers differ from their names", async () => {
-		const { harness, calls } = await setupSlow({ name: "slow-docs" }, 30);
+		const { harness, calls } = await setupSlow({ name: "slow-docs", exposure: "codemode" }, 30);
 		harness.setResponses([
 			fauxAssistantMessage(
 				[
@@ -875,7 +876,7 @@ return [...new Set(await Promise.all(names.map(async (name) => (await describeNa
 	});
 
 	it("does not wait for servers a codemode script does not name", async () => {
-		const { harness } = await setupSlow({}, Number.POSITIVE_INFINITY);
+		const { harness } = await setupSlow({ exposure: "codemode" }, Number.POSITIVE_INFINITY);
 		harness.setResponses([
 			fauxAssistantMessage([fauxToolCall("codemode", { code: "return 1 + 1;" })], { stopReason: "toolUse" }),
 			fauxAssistantMessage("done"),
@@ -1016,6 +1017,34 @@ return [...new Set(await Promise.all(names.map(async (name) => (await describeNa
 		expect(harness.session.getActiveToolNames()).toContain(searchName);
 	});
 
+	it("treats servers without exposure as deferred: activates tool_search, not codemode, and loads tools found", async () => {
+		const { harness, calls } = await setup(undefined);
+		const searchName = createMcpToolName("docs", "search");
+		// Activated from the config, before the server connects or the model is called.
+		expect(harness.session.getActiveToolNames()).toEqual(["tool_search"]);
+		harness.setResponses([
+			fauxAssistantMessage([fauxToolCall("tool_search", { query: "search the docs", limit: 1 })], {
+				stopReason: "toolUse",
+			}),
+			fauxAssistantMessage([fauxToolCall(searchName, { query: "default" })], { stopReason: "toolUse" }),
+			fauxAssistantMessage("done"),
+		]);
+		await harness.session.prompt("find a docs tool");
+
+		expect(harness.session.getActiveToolNames()).toEqual(["tool_search", searchName]);
+		// Only the tool the search loaded is declared to the model.
+		expect(declaredToolNames(harness)).toEqual(["tool_search", searchName]);
+		expect(getMessageText(toolResult(harness, "tool_search"))).toBe(
+			`Loaded 1 tool. They are available from your next call:\n- ${searchName}: Search the docs.`,
+		);
+		expect(getMessageText(toolResult(harness, searchName))).toBe("default guide\ndefault faq");
+		expect(calls).toEqual(['search:{"query":"default"}']);
+		// The prompt names tool_search as the only way to reach the server's tools.
+		const section = serversSection(harness);
+		expect(section).toContain("- mcp__docs (tool_search)");
+		expect(section).not.toContain("codemode");
+	});
+
 	it("finds nothing to load when every matching tool is already declared", async () => {
 		const { harness } = await setup("direct", undefined, { builtInTools: ["tool_search"] });
 		harness.setResponses([
@@ -1078,7 +1107,7 @@ describe("AgentSession MCP servers registered by extensions", () => {
 		if (!api) throw new Error("No extension API");
 		const pi = api;
 
-		pi.registerMcpServer("late", { url: "http://late.invalid" });
+		pi.registerMcpServer("late", { url: "http://late.invalid", exposure: "codemode" });
 		await vi.waitFor(() => expect(harness.session.getCallableToolNames()).toContain("mcp__late__search"));
 		expect(connected.map((entry) => entry.name)).toEqual(["late"]);
 		// Codemode-exposed tools need the codemode tool, which is activated for them.
@@ -1086,6 +1115,22 @@ describe("AgentSession MCP servers registered by extensions", () => {
 
 		pi.unregisterMcpServer("late");
 		await vi.waitFor(() => expect(harness.session.getCallableToolNames()).not.toContain("mcp__late__search"));
+	});
+
+	it("activates tool_search, not codemode, for registered servers without exposure", async () => {
+		let api: ExtensionAPI | undefined;
+		const { harness } = await setup([
+			(pi) => {
+				api = pi;
+			},
+			createToolSearchExtension(),
+		]);
+		if (!api) throw new Error("No extension API");
+
+		api.registerMcpServer("late", { url: "http://late.invalid" });
+		await vi.waitFor(() => expect(harness.session.getCallableToolNames()).toContain("mcp__late__search"));
+
+		expect(harness.session.getActiveToolNames()).toEqual(["tool_search"]);
 	});
 
 	// "my_docs" shares the namespace of "my-docs" (#10239).
