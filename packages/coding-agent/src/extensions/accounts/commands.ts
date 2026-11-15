@@ -1,0 +1,560 @@
+import type { Api, Model } from "@earendil-works/pi-ai";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../core/extensions/types.ts";
+import { openBrowser } from "../../utils/open-browser.ts";
+import { ALL_POOL, accountDisplayName, accountProviderId, familyTitle, poolProviderId } from "./catalog.ts";
+import type { BrokerAccount, BrokerClient, BrokerLogin } from "./client.ts";
+import type { AccountProviderSpec } from "./provider.ts";
+import type { AccountRegistry } from "./registry.ts";
+
+export interface AccountCommandDeps {
+	pi: ExtensionAPI;
+	client: BrokerClient;
+	registry: AccountRegistry;
+}
+
+/** `/account` subcommands, also used for argument completion. */
+export const ACCOUNT_SUBCOMMANDS = [
+	"status",
+	"list",
+	"switch",
+	"default",
+	"add",
+	"remove",
+	"enable",
+	"disable",
+	"reset",
+] as const;
+
+/** A browser sign-in through the broker. `namePrompt` is set when the account needs a name first. */
+interface LoginWay {
+	id: string;
+	label: string;
+	kind: "login";
+	/** Broker login provider. */
+	provider: string;
+	/** What the user signs in to, for messages. */
+	title: string;
+	namePrompt?: string;
+}
+
+/** A provider API key typed in; the broker validates it. */
+interface ApiKeyWay {
+	id: string;
+	label: string;
+	kind: "api-key";
+	provider: "claude" | "openai";
+	title: string;
+	placeholder: string;
+}
+
+type AddWay = LoginWay | ApiKeyWay;
+
+interface AddFamily {
+	id: string;
+	label: string;
+	ways: readonly AddWay[];
+}
+
+/**
+ * What `/account add` offers: the first menu lists the families, the second the ways of one family;
+ * a family with a single way skips the second menu. `claude-api-credits` signs in to a Claude Console
+ * organization through `ant`. The ids are the arguments of `/account add <id>`.
+ */
+const ADD_FAMILIES: readonly AddFamily[] = [
+	{
+		id: "claude",
+		label: "Claude account",
+		ways: [
+			{
+				id: "claude-subscription",
+				label: "Subscription (Pro, Max, Team sign-in)",
+				kind: "login",
+				provider: "claude",
+				title: familyTitle("claude"),
+			},
+			{
+				id: "claude-api-credits",
+				label: "API credits (monthly credits of Max, Ultra, Team plans, Claude Console sign-in)",
+				kind: "login",
+				provider: "claude-api-credits",
+				title: "the Claude Console",
+				namePrompt: "Name for this API-credit account",
+			},
+			{
+				id: "claude-api-key",
+				label: "API key (Anthropic Console key)",
+				kind: "api-key",
+				provider: "claude",
+				title: "Anthropic",
+				placeholder: "sk-ant-api03-...",
+			},
+		],
+	},
+	{
+		id: "chatgpt",
+		label: "ChatGPT account",
+		ways: [
+			{
+				id: "openai-api-key",
+				label: "API key (OpenAI API credits)",
+				kind: "api-key",
+				provider: "openai",
+				title: "OpenAI",
+				placeholder: "sk-...",
+			},
+			{
+				id: "codex",
+				label: "Subscription (ChatGPT sign-in through Codex)",
+				kind: "login",
+				provider: "codex",
+				title: familyTitle("codex"),
+			},
+		],
+	},
+];
+
+/** Arguments of `/account add`, in menu order, for argument completion and the usage warning. */
+export const ADD_ARGUMENTS: readonly { id: string; label: string }[] = ADD_FAMILIES.flatMap((family) => [
+	family,
+	...family.ways,
+]);
+
+const LOGIN_TIMEOUT_MS = 5 * 60_000;
+const LOGIN_POLL_MS = 1_000;
+
+/** `/accounts`: list accounts with their state and manage one. */
+export async function showAccounts(deps: AccountCommandDeps, ctx: ExtensionCommandContext): Promise<void> {
+	const addLabel = "+ Add account";
+	const restartLabel = "Restart broker (reloads config.yaml)";
+	for (;;) {
+		const accounts = await deps.registry.sync(ctx);
+		if (!ctx.hasUI) {
+			ctx.ui.notify(formatAccountList(accounts, ctx), "info");
+			return;
+		}
+		const options = [...accounts.map((account) => accountLine(account, ctx)), addLabel, restartLabel];
+		const choice = await ctx.ui.select(`Accounts (${accounts.length})`, options);
+		if (!choice) return;
+		if (choice === addLabel) {
+			await addAccount(deps, ctx, "");
+			continue;
+		}
+		if (choice === restartLabel) {
+			await deps.client.shutdown();
+			ctx.ui.notify("Account broker stopped; it restarts on the next request.", "info");
+			continue;
+		}
+		const account = accounts[options.indexOf(choice)];
+		if (account) await manageAccount(deps, ctx, account);
+	}
+}
+
+/** `/account <subcommand> [query]`. */
+export async function runAccountCommand(
+	deps: AccountCommandDeps,
+	args: string,
+	ctx: ExtensionCommandContext,
+): Promise<void> {
+	const [subcommand = "status", ...rest] = args.trim().split(/\s+/).filter(Boolean);
+	const query = rest.join(" ");
+	switch (subcommand) {
+		case "status":
+			showStatus(deps, ctx);
+			return;
+		case "list":
+			await showAccounts(deps, ctx);
+			return;
+		case "switch":
+			await switchAccount(deps, ctx, query, false);
+			return;
+		case "default":
+			await switchAccount(deps, ctx, query, true);
+			return;
+		case "add":
+			await addAccount(deps, ctx, query);
+			return;
+		case "remove":
+		case "enable":
+		case "disable":
+		case "reset": {
+			const accounts = await deps.registry.sync(ctx);
+			const account = await chooseAccount(ctx, accounts, `${subcommand} account`, query);
+			if (account) await applyAccountAction(deps, ctx, account, subcommand);
+			return;
+		}
+	}
+	ctx.ui.notify(`Usage: /account [${ACCOUNT_SUBCOMMANDS.join("|")}] [account]`, "warning");
+}
+
+/** `/models [account]`: list the models of the session's account, or of another one, and switch. */
+export async function showModels(deps: AccountCommandDeps, query: string, ctx: ExtensionCommandContext): Promise<void> {
+	await deps.registry.sync(ctx);
+	const providers = deps.registry.providers().filter((spec) => !spec.disabled);
+	const candidates = query ? matchProviders(providers, query) : providers;
+	const current = query ? undefined : deps.registry.provider(ctx.model?.provider ?? "");
+	const spec =
+		current ??
+		(candidates.length === 1 ? candidates[0] : await chooseProvider(ctx, candidates, "Models of which account?"));
+	if (!spec) return;
+	const models = providerModels(ctx, spec);
+	if (!ctx.hasUI) {
+		ctx.ui.notify([`${spec.name}:`, ...models.map((model) => `  ${model.id}`)].join("\n"), "info");
+		return;
+	}
+	const model = await chooseModel(ctx, spec, models);
+	if (model) await useModel(deps, ctx, spec, model);
+}
+
+function showStatus(deps: AccountCommandDeps, ctx: ExtensionContext): void {
+	const model = ctx.model;
+	const spec = deps.registry.provider(model?.provider ?? "");
+	if (!model || !spec) {
+		const current = model ? `${model.provider}/${model.id}` : "no model";
+		ctx.ui.notify(`This session uses ${current}, not a broker account. Use /account switch.`, "info");
+		return;
+	}
+	const routing =
+		spec.target.type === "account"
+			? "pinned; failures are reported, never rerouted"
+			: "pool; the broker balances and fails over";
+	ctx.ui.notify(`This session uses ${model.id} on ${spec.name} (${routing}).`, "info");
+}
+
+async function manageAccount(
+	deps: AccountCommandDeps,
+	ctx: ExtensionCommandContext,
+	account: BrokerAccount,
+): Promise<void> {
+	const actions = {
+		use: "Use in this session",
+		model: "Choose model",
+		toggle: account.disabled ? "Enable" : "Disable",
+		reset: "Clear cooldown",
+		remove: "Remove",
+	};
+	const choice = await ctx.ui.select(accountDisplayName(account), [...Object.values(actions), "Back"]);
+	const spec = deps.registry.provider(accountProviderId(account.id));
+	if (choice === actions.use && spec) await switchTo(deps, ctx, spec, false);
+	else if (choice === actions.model && spec) {
+		const model = await chooseModel(ctx, spec, providerModels(ctx, spec));
+		if (model) await useModel(deps, ctx, spec, model);
+	} else if (choice === actions.toggle)
+		await applyAccountAction(deps, ctx, account, account.disabled ? "enable" : "disable");
+	else if (choice === actions.reset) await applyAccountAction(deps, ctx, account, "reset");
+	else if (choice === actions.remove) await applyAccountAction(deps, ctx, account, "remove");
+}
+
+async function applyAccountAction(
+	deps: AccountCommandDeps,
+	ctx: ExtensionCommandContext,
+	account: BrokerAccount,
+	action: "remove" | "enable" | "disable" | "reset",
+): Promise<void> {
+	const name = accountDisplayName(account);
+	if (action === "remove") {
+		if (ctx.hasUI && !(await ctx.ui.confirm("Remove account?", `${name}\nIts stored credential is deleted.`))) return;
+		await deps.client.removeAccount(account.key);
+	} else if (action === "reset") {
+		await deps.client.resetCooldown(account.key);
+	} else {
+		await deps.client.setDisabled(account.key, action === "disable");
+	}
+	await deps.registry.sync(ctx);
+	const done = { remove: "Removed", enable: "Enabled", disable: "Disabled", reset: "Cleared cooldown for" }[action];
+	ctx.ui.notify(`${done} ${name}`, "info");
+}
+
+/** Switch this session to an account or pool; with `persist` it also becomes the default for new sessions. */
+async function switchAccount(
+	deps: AccountCommandDeps,
+	ctx: ExtensionCommandContext,
+	query: string,
+	persist: boolean,
+): Promise<void> {
+	await deps.registry.sync(ctx);
+	const providers = deps.registry.providers().filter((spec) => !spec.disabled);
+	if (providers.length === 0) {
+		ctx.ui.notify("No accounts yet. Add one with /account add.", "warning");
+		return;
+	}
+	const matches = query ? matchProviders(providers, query) : providers;
+	const title = persist ? "Use for this and new sessions" : "Switch this session to";
+	const spec = matches.length === 1 ? matches[0] : await chooseProvider(ctx, matches, title);
+	if (spec) await switchTo(deps, ctx, spec, persist);
+}
+
+/** Switch to an account, keeping the current model id when the account offers it. */
+async function switchTo(
+	deps: AccountCommandDeps,
+	ctx: ExtensionCommandContext,
+	spec: AccountProviderSpec,
+	persist: boolean,
+): Promise<void> {
+	const models = providerModels(ctx, spec);
+	const sameModel = models.find((model) => model.id === ctx.model?.id);
+	const model = sameModel ?? (models.length === 1 ? models[0] : await chooseModel(ctx, spec, models));
+	if (model) await useModel(deps, ctx, spec, model, persist);
+}
+
+async function useModel(
+	deps: AccountCommandDeps,
+	ctx: ExtensionCommandContext,
+	spec: AccountProviderSpec,
+	model: Model<Api>,
+	persist = false,
+): Promise<void> {
+	const previous = ctx.model;
+	if (!(await deps.pi.setModel(model, { persist }))) {
+		ctx.ui.notify(`${spec.name} is not available. Check /accounts.`, "error");
+		return;
+	}
+	// Pi keys signatures and encrypted reasoning to provider + model, so a different account never
+	// replays the previous account's continuation state; text and tool history are kept.
+	const changedAccount = previous !== undefined && previous.provider !== model.provider;
+	const scope = persist ? "This and new sessions use" : "This session now uses";
+	const history = changedAccount ? " Conversation history is kept; earlier reasoning is replayed as a summary." : "";
+	ctx.ui.notify(`${scope} ${model.id} on ${spec.name}.${history}`, "info");
+}
+
+/**
+ * After the first account is added, make the combined pool the default when no default model is
+ * configured, so new sessions draw on every account.
+ */
+async function adoptPoolAsDefault(deps: AccountCommandDeps, ctx: ExtensionCommandContext): Promise<void> {
+	if (deps.pi.getSettings().defaultProvider) return;
+	const pool = deps.registry.provider(poolProviderId(ALL_POOL));
+	if (pool) await switchTo(deps, ctx, pool, true);
+}
+
+async function addAccount(deps: AccountCommandDeps, ctx: ExtensionCommandContext, requested: string): Promise<void> {
+	if (!ctx.hasUI) {
+		ctx.ui.notify("Adding an account needs interactive mode.", "warning");
+		return;
+	}
+	const way = await chooseAddWay(ctx, requested.trim().toLowerCase());
+	if (!way) return;
+	const hadAccounts = deps.registry.providers().length > 0;
+	const account =
+		way.kind === "api-key" ? await addApiKeyAccount(deps, ctx, way) : await signInAccount(deps, ctx, way);
+	if (account) await finishAdding(deps, ctx, account, hadAccounts);
+}
+
+/** The way to add an account, from the argument of `/account add` or from the menus; undefined when cancelled. */
+async function chooseAddWay(ctx: ExtensionCommandContext, argument: string): Promise<AddWay | undefined> {
+	if (!argument) return chooseFromMenus(ctx);
+	const family = ADD_FAMILIES.find((entry) => entry.id === argument);
+	if (family) return chooseWay(ctx, family);
+	const way = ADD_FAMILIES.flatMap((entry) => entry.ways).find((entry) => entry.id === argument);
+	if (!way) {
+		const valid = ADD_ARGUMENTS.map((entry) => entry.id).join(", ");
+		ctx.ui.notify(`Unknown account type "${argument}". Use one of: ${valid}.`, "warning");
+	}
+	return way;
+}
+
+/** First menu (families), then the family's ways; Escape at the second menu returns to the first. */
+async function chooseFromMenus(ctx: ExtensionCommandContext): Promise<AddWay | undefined> {
+	for (;;) {
+		const family = await selectEntry(ctx, "Add account", ADD_FAMILIES);
+		if (!family) return undefined;
+		const way = await chooseWay(ctx, family);
+		if (way) return way;
+	}
+}
+
+async function chooseWay(ctx: ExtensionCommandContext, family: AddFamily): Promise<AddWay | undefined> {
+	if (family.ways.length === 1) return family.ways[0];
+	return selectEntry(ctx, `Add ${family.label}`, family.ways);
+}
+
+async function selectEntry<T extends { label: string }>(
+	ctx: ExtensionCommandContext,
+	title: string,
+	entries: readonly T[],
+): Promise<T | undefined> {
+	const choice = await ctx.ui.select(
+		title,
+		entries.map((entry) => entry.label),
+	);
+	return entries.find((entry) => entry.label === choice);
+}
+
+/** Sign in through the broker's browser login; undefined when the user cancels or it times out. */
+async function signInAccount(
+	deps: AccountCommandDeps,
+	ctx: ExtensionCommandContext,
+	way: LoginWay,
+): Promise<BrokerAccount | undefined> {
+	let name: string | undefined;
+	if (way.namePrompt) {
+		name = (await ctx.ui.input(way.namePrompt, "for example: work"))?.trim();
+		if (!name) return undefined;
+	}
+	const login = await deps.client.startLogin(way.provider, name);
+	openBrowser(login.url);
+	ctx.ui.notify(
+		`Sign in to ${way.title} in your browser. If it did not open, visit:\n${login.url}${login.userCode ? `\nCode: ${login.userCode}` : ""}`,
+		"info",
+	);
+	return waitForLogin(deps, ctx, login, way.title);
+}
+
+async function waitForLogin(
+	deps: AccountCommandDeps,
+	ctx: ExtensionCommandContext,
+	login: BrokerLogin,
+	title: string,
+): Promise<BrokerAccount | undefined> {
+	// The broker's callback listener normally completes the login. The input lets the user paste the
+	// redirect URL when the browser cannot reach it (remote or headless sessions).
+	const dismiss = new AbortController();
+	let finished = false;
+	let cancelled = false;
+	void ctx.ui
+		.input(`Waiting for ${title} sign-in`, "Paste the redirect URL only if the browser shows an error", {
+			signal: dismiss.signal,
+		})
+		.then(async (value) => {
+			if (finished) return;
+			if (value?.trim()) await deps.client.submitLoginCallback(login.state, value.trim());
+			else cancelled = true;
+		})
+		.catch((error: unknown) => {
+			cancelled = true;
+			ctx.ui.notify(`Callback rejected: ${error instanceof Error ? error.message : String(error)}`, "error");
+		});
+
+	let account: BrokerAccount | undefined;
+	try {
+		const deadline = Date.now() + LOGIN_TIMEOUT_MS;
+		while (!cancelled && Date.now() < deadline) {
+			const status = await deps.client.loginStatus(login.state);
+			if (status.status === "error") throw new Error(status.error ?? "Sign-in failed");
+			if (status.status === "ok") {
+				account = status.account;
+				break;
+			}
+			await new Promise((resolve) => setTimeout(resolve, LOGIN_POLL_MS));
+		}
+	} finally {
+		finished = true;
+		dismiss.abort();
+		if (!account) await deps.client.cancelLogin(login.state).catch(() => {});
+	}
+	if (!account) ctx.ui.notify(cancelled ? "Sign-in cancelled." : "Sign-in timed out.", "warning");
+	return account;
+}
+
+async function finishAdding(
+	deps: AccountCommandDeps,
+	ctx: ExtensionCommandContext,
+	account: BrokerAccount,
+	hadAccounts: boolean,
+): Promise<void> {
+	await deps.registry.sync(ctx);
+	ctx.ui.notify(`Added ${accountDisplayName(account)}. It funds the matching pools; /account switch pins it.`, "info");
+	if (!hadAccounts) await adoptPoolAsDefault(deps, ctx);
+}
+
+/** Ask for a provider API key and add it after the broker validates it. */
+async function addApiKeyAccount(
+	deps: AccountCommandDeps,
+	ctx: ExtensionCommandContext,
+	way: ApiKeyWay,
+): Promise<BrokerAccount | undefined> {
+	const name = (await ctx.ui.input("Name for this API key", "for example: work"))?.trim();
+	if (!name) return undefined;
+	// Extension dialogs have no masked input, so the key is visible while typed.
+	const key = (await ctx.ui.input(`${way.title} API key (visible while typing)`, way.placeholder))?.trim();
+	if (!key) return undefined;
+	const account = await deps.client.addApiKey(name, key, way.provider);
+	if (!account) ctx.ui.notify("The broker did not return the new account.", "warning");
+	return account;
+}
+
+function providerModels(ctx: ExtensionContext, spec: AccountProviderSpec): Model<Api>[] {
+	return ctx.modelRegistry.getAll().filter((model) => model.provider === spec.id);
+}
+
+async function chooseModel(
+	ctx: ExtensionCommandContext,
+	spec: AccountProviderSpec,
+	models: readonly Model<Api>[],
+): Promise<Model<Api> | undefined> {
+	if (models.length === 0) {
+		ctx.ui.notify(`${spec.name} reports no models.`, "warning");
+		return undefined;
+	}
+	const options = models.map((model) => (model.name === model.id ? model.id : `${model.id}  ${model.name}`));
+	const choice = await ctx.ui.select(`Model on ${spec.name}`, options);
+	return choice ? models[options.indexOf(choice)] : undefined;
+}
+
+async function chooseProvider(
+	ctx: ExtensionCommandContext,
+	providers: readonly AccountProviderSpec[],
+	title: string,
+): Promise<AccountProviderSpec | undefined> {
+	if (providers.length === 0) {
+		ctx.ui.notify("No matching accounts.", "warning");
+		return undefined;
+	}
+	const options = providers.map((spec) => (spec.id === ctx.model?.provider ? `${spec.name} (current)` : spec.name));
+	const choice = await ctx.ui.select(title, options);
+	return choice ? providers[options.indexOf(choice)] : undefined;
+}
+
+async function chooseAccount(
+	ctx: ExtensionCommandContext,
+	accounts: readonly BrokerAccount[],
+	title: string,
+	query: string,
+): Promise<BrokerAccount | undefined> {
+	const matches = query ? accounts.filter((account) => accountMatches(account, query)) : accounts;
+	if (matches.length === 1) return matches[0];
+	if (matches.length === 0 || !ctx.hasUI) {
+		ctx.ui.notify(
+			matches.length === 0 ? "No matching accounts." : "Several accounts match; name one exactly.",
+			"warning",
+		);
+		return undefined;
+	}
+	const options = matches.map((account) => accountDisplayName(account));
+	const choice = await ctx.ui.select(title, options);
+	return choice ? matches[options.indexOf(choice)] : undefined;
+}
+
+function accountMatches(account: BrokerAccount, query: string): boolean {
+	const needle = query.toLowerCase();
+	return [account.id, accountProviderId(account.id), account.email, account.label]
+		.filter((value): value is string => value !== undefined)
+		.some((value) => value.toLowerCase().includes(needle));
+}
+
+function matchProviders(providers: readonly AccountProviderSpec[], query: string): AccountProviderSpec[] {
+	const needle = query.toLowerCase();
+	const exact = providers.filter((spec) => spec.id.toLowerCase() === needle);
+	return exact.length > 0
+		? exact
+		: providers.filter((spec) => `${spec.id} ${spec.name}`.toLowerCase().includes(needle));
+}
+
+function accountLine(account: BrokerAccount, ctx: ExtensionContext): string {
+	const current = ctx.model?.provider === accountProviderId(account.id) ? "* " : "  ";
+	return `${current}${accountDisplayName(account)} - ${accountState(account)} - ${account.modelCount} models`;
+}
+
+function formatAccountList(accounts: readonly BrokerAccount[], ctx: ExtensionContext): string {
+	if (accounts.length === 0) return "No accounts. Add one with /account add in interactive mode.";
+	return accounts.map((account) => accountLine(account, ctx)).join("\n");
+}
+
+/** Short availability summary from broker state. */
+function accountState(account: BrokerAccount): string {
+	if (account.disabled) return "disabled";
+	if (account.retryAfter) return `cooling down until ${new Date(account.retryAfter).toLocaleTimeString()}`;
+	if (account.quotaExceeded) return "quota exceeded";
+	if (account.unavailable) return account.statusMessage ? `unavailable: ${account.statusMessage}` : "unavailable";
+	if (account.status === "error" && account.lastError) return `error: ${account.lastError.message}`;
+	return "ready";
+}

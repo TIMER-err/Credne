@@ -5,9 +5,19 @@ import type {
 	Message,
 	Model,
 	TextContent,
+	ThinkingContent,
 	ToolCall,
 	ToolResultMessage,
 } from "../types.ts";
+
+/**
+ * Labels the text that replaces another model's thinking. The label marks it as earlier private
+ * reasoning so the new model does not continue it as part of the visible reply.
+ */
+export const REASONING_SUMMARY_LABEL = "[Reasoning summary from an earlier turn, not shown to the user]";
+
+/** Longest reasoning summary replayed to another model; providers already return summarized reasoning. */
+const MAX_REASONING_SUMMARY_CHARS = 1500;
 
 const NON_VISION_USER_IMAGE_PLACEHOLDER = "(image omitted: model does not support images)";
 const NON_VISION_TOOL_IMAGE_PLACEHOLDER = "(tool image omitted: model does not support images)";
@@ -83,6 +93,15 @@ function downgradeUnsupportedImages<TApi extends Api>(messages: Message[], model
 	});
 }
 
+/** Readable summary of another model's thinking, or nothing for redacted or empty thinking. */
+function reasoningSummary(block: ThinkingContent): TextContent[] {
+	const text = block.redacted ? "" : block.thinking.trim();
+	if (!text) return [];
+	const summary =
+		text.length > MAX_REASONING_SUMMARY_CHARS ? `${text.slice(0, MAX_REASONING_SUMMARY_CHARS).trimEnd()} …` : text;
+	return [{ type: "text", text: `${REASONING_SUMMARY_LABEL}\n${summary}` }];
+}
+
 /**
  * Normalize tool call ID for cross-provider compatibility.
  * OpenAI Responses API generates IDs that are 450+ chars with special characters like `|`.
@@ -126,10 +145,10 @@ export function transformMessages<TApi extends Api>(
 
 			const transformedContent = assistantMsg.content.flatMap((block) => {
 				if (block.type === "thinking") {
-					// Thinking from another model is dropped. Signatures and encrypted reasoning are
-					// only valid for the model that produced them, and sending readable thinking as
-					// plain text makes the new model treat it as part of the visible reply.
-					if (!isSameModel) return [];
+					// Signatures and encrypted reasoning are only valid for the model (and account) that
+					// produced them, so another model gets a labeled plain-text summary instead (#10995:
+					// unlabeled thinking was continued as part of the visible reply).
+					if (!isSameModel) return reasoningSummary(block);
 					// Keep redacted and signed blocks even if the thinking text is empty
 					// (OpenAI encrypted reasoning); they are needed for replay.
 					if (block.redacted || block.thinkingSignature) return block;

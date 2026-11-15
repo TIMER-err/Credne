@@ -480,6 +480,14 @@ export function getExamplesPath(): string {
 	return resolve(join(getPackageDir(), "examples"));
 }
 
+/** Resolves bundled subagent definitions in source, installed packages, and standalone binaries. */
+export function getBundledAgentsDir(): string {
+	const packageDir = getPackageDir();
+	if (isBunBinary) return join(packageDir, "subagent-agents");
+	const srcOrDist = existsSync(join(packageDir, "src")) ? "src" : "dist";
+	return join(packageDir, srcOrDist, "extensions", "subagent", "agents");
+}
+
 /** Get path to CHANGELOG.md */
 export function getChangelogPath(): string {
 	return resolve(join(getPackageDir(), "CHANGELOG.md"));

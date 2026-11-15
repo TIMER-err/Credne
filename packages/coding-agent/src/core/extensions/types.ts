@@ -1834,10 +1834,11 @@ export interface ExtensionAPI {
 	// =========================================================================
 
 	/**
-	 * Set the model for the current session without changing the configured default for new sessions.
-	 * Returns false if authentication is not configured for the model's provider.
+	 * Set the model for the current session. With `persist: true` it also becomes the configured default for
+	 * new sessions, as when the user picks it in `/model`. Returns false if authentication is not configured
+	 * for the model's provider.
 	 */
-	setModel(model: Model<any>): Promise<boolean>;
+	setModel(model: Model<any>, options?: SetModelOptions): Promise<boolean>;
 
 	/** Get current thinking level. */
 	getThinkingLevel(): ThinkingLevel;
@@ -2188,7 +2189,13 @@ export type SetActiveToolsHandler = (toolNames: string[]) => void;
 
 export type RefreshToolsHandler = () => void;
 
-export type SetModelHandler = (model: Model<any>) => Promise<boolean>;
+/** Options for {@link ExtensionAPI.setModel}. */
+export interface SetModelOptions {
+	/** Also save the model as the default for new sessions. */
+	persist?: boolean;
+}
+
+export type SetModelHandler = (model: Model<any>, options?: SetModelOptions) => Promise<boolean>;
 
 export type GetThinkingLevelHandler = () => ThinkingLevel;
 

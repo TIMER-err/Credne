@@ -1,0 +1,10 @@
+# Build output of scripts/build.mjs
+dist/
+bin/
+docs/
+examples/
+node_modules/
+README.md
+CHANGELOG.md
+THIRD_PARTY_NOTICES.md
+package-lock.json

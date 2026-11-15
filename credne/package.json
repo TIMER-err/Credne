@@ -1,0 +1,36 @@
+{
+	"name": "@neilhuang007/credne",
+	"version": "0.1.0",
+	"description": "Pi-based coding agent that pools Claude and ChatGPT subscriptions, Claude API credits and API keys through an embedded CLIProxyAPI broker",
+	"type": "module",
+	"private": true,
+	"piConfig": {
+		"name": "credne",
+		"configDir": ".credne"
+	},
+	"bin": {
+		"credne": "dist/bundle/cli.js",
+		"hlowrd": "dist/bundle/cli.js"
+	},
+	"files": [
+		"dist",
+		"bin",
+		"docs",
+		"examples",
+		"README.md",
+		"CHANGELOG.md",
+		"THIRD_PARTY_NOTICES.md"
+	],
+	"scripts": {
+		"build": "node scripts/build.mjs"
+	},
+	"dependencies": {
+		"@silvia-odwyer/photon-node": "0.3.4",
+		"jiti": "2.7.0",
+		"quickjs-wasi": "3.6.2"
+	},
+	"engines": {
+		"node": ">=22.19.0"
+	},
+	"license": "MIT"
+}
