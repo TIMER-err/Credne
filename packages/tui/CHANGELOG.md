@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added a `leave` mouse event in fullscreen mode. The component that handled the last `move` receives it once the pointer moves off it, so hover highlights can be cleared
+- Added `Editor.placeholder`, a styled hint shown after the cursor while the editor is empty
+
 ### Fixed
 
 - Fixed fullscreen Kitty images disappearing after a full redraw such as a window resize. Clearing the screen made Kitty free the cached image data that the redraw then tried to reuse ([#12010](https://github.com/earendil-works/pi/issues/12010))

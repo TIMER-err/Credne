@@ -2,6 +2,7 @@ import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { estimateTokens } from "../../src/core/compaction/index.ts";
 import { createHarness, getMessageText, type Harness } from "./harness.ts";
 
 function deferred(): { promise: Promise<void>; resolve: () => void } {
@@ -535,7 +536,10 @@ describe("AgentSession actionable boundaries", () => {
 		await harness.session.prompt("small prompt");
 
 		expect(harness.eventsOfType("compaction_start")).toEqual([]);
-		expect(harness.session.getContextUsage()?.tokens).toBeLessThan(2_000);
+		const estimatedTokens = harness.sessionManager
+			.buildSessionProjection()
+			.messages.reduce((total, message) => total + estimateTokens(message), 0);
+		expect(harness.session.getContextUsage()?.tokens).toBe(estimatedTokens);
 	});
 
 	it("does not trigger successful-response overflow from usage captured before a boundary edit", async () => {
@@ -572,7 +576,10 @@ describe("AgentSession actionable boundaries", () => {
 		await harness.session.prompt("large input that is later omitted");
 
 		expect(harness.eventsOfType("compaction_start")).toEqual([]);
-		expect(harness.session.getContextUsage()?.tokens).toBeLessThan(2_000);
+		const estimatedTokens = harness.sessionManager
+			.buildSessionProjection()
+			.messages.reduce((total, message) => total + estimateTokens(message), 0);
+		expect(harness.session.getContextUsage()?.tokens).toBe(estimatedTokens);
 	});
 
 	it("does not trigger threshold compaction from post-edit usage captured before a later compaction", async () => {
@@ -744,7 +751,7 @@ describe("durable length recovery", () => {
 		while (harnesses.length > 0) harnesses.pop()?.cleanup();
 	});
 
-	it("keeps truncated tool attempts in context for the natural next turn", async () => {
+	it("keeps truncated tool diagnostics in the transcript but omits the failed pair on the next turn", async () => {
 		let executed = false;
 		const requests: string[] = [];
 		const tool: AgentTool = {
@@ -773,7 +780,13 @@ describe("durable length recovery", () => {
 
 		expect(executed).toBe(false);
 		expect(harness.faux.state.callCount).toBe(2);
-		expect(requests[0]).toContain("may be truncated");
+		expect(requests[0]).not.toContain("may be truncated");
+		expect(harness.sessionManager.getEntries()).toContainEqual(
+			expect.objectContaining({
+				type: "message",
+				message: expect.objectContaining({ role: "toolResult", isError: true }),
+			}),
+		);
 		expect(harness.sessionManager.getEntries().some((entry) => entry.type === "context_edit")).toBe(false);
 	});
 

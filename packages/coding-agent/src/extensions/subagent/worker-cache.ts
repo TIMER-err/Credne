@@ -25,7 +25,7 @@ export function registerWorkerCache(pi: ExtensionAPI, requestParent?: RequestPar
 		if (!isReady || !identity) identity = next.identity;
 		if (!isReady) await requestParent?.({ type: "cache_wait", ...identity }, undefined);
 		return Value.Check(keyedPayloadSchema, next.payload)
-			? { ...next.payload, prompt_cache_key: `subagent-${identity.key.slice(0, 48)}` }
+			? { ...next.payload, prompt_cache_key: `subagent-${identity.sharedKey.slice(0, 48)}` }
 			: next.payload;
 	});
 	pi.on("provider_stream_event", async (event, ctx) => {
@@ -121,7 +121,6 @@ function identifyPrefix(
 	const sharedKey = createHash("sha256")
 		.update(
 			JSON.stringify([
-				process.env.PI_SUBAGENT_AGENT_NAME,
 				ctx.cwd,
 				ctx.model?.provider,
 				ctx.model?.api,

@@ -111,6 +111,20 @@ describe("SettingsManager", () => {
 		});
 	});
 
+	describe("update notification version", () => {
+		it("persists the latest version after its startup notice is shown", async () => {
+			const settingsPath = join(agentDir, "settings.json");
+			const manager = SettingsManager.create(projectDir, agentDir);
+
+			expect(manager.getLastUpdateNotificationVersion()).toBeUndefined();
+			manager.setLastUpdateNotificationVersion("1.5.3");
+			await manager.flush();
+
+			expect(JSON.parse(readFileSync(settingsPath, "utf-8")).lastUpdateNotificationVersion).toBe("1.5.3");
+			expect(SettingsManager.create(projectDir, agentDir).getLastUpdateNotificationVersion()).toBe("1.5.3");
+		});
+	});
+
 	describe("deviceId", () => {
 		it("creates one global device ID and reuses it in later processes", async () => {
 			const settingsPath = join(agentDir, "settings.json");

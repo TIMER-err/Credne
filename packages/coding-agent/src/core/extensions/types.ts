@@ -57,7 +57,7 @@ import type {
 	TUI,
 } from "@earendil-works/pi-tui";
 import type { Static, TSchema } from "typebox";
-import type { Theme } from "../../modes/interactive/theme/theme.ts";
+import type { Theme, ThemeColor } from "../../modes/interactive/theme/theme.ts";
 import type { BashResult } from "../bash-executor.ts";
 import type { CacheWarmingDecisionEvent, CacheWarmingDecisionEventResult } from "../cache-warmer.ts";
 import type { CompactionPreparation, CompactionResult } from "../compaction/index.ts";
@@ -127,6 +127,18 @@ export type WidgetPlacement = "aboveEditor" | "belowEditor";
 export interface ExtensionWidgetOptions {
 	/** Where the widget is rendered. Defaults to "aboveEditor". */
 	placement?: WidgetPlacement;
+}
+
+/** A view shown in place of the chat transcript; the input box sends to it until the view is cleared. */
+export interface ExtensionMainView {
+	/** Short name shown as an `@label` badge at the right of the input box's top border and in its placeholder. */
+	label: string;
+	/** Theme color for the input box border, badge and placeholder while the view is shown. Defaults to accent. */
+	color?: ThemeColor;
+	/** Builds the component shown in place of the chat transcript. */
+	component: (tui: TUI, theme: Theme) => Component & { dispose?(): void };
+	/** Receives text submitted from the input box. Slash commands still run in the main session. */
+	onSubmit: (text: string) => void;
 }
 
 /** Raw terminal input listener for extensions. */
@@ -221,6 +233,22 @@ export interface ExtensionUIContext {
 
 	/** Set a custom header component (shown at startup, above chat), or undefined to restore the built-in header. */
 	setHeader(factory: ((tui: TUI, theme: Theme) => Component & { dispose?(): void }) | undefined): void;
+
+	/**
+	 * Show a view in place of the chat transcript and route input box submissions to it, or pass undefined to
+	 * return to the main session. Escape in the input box also returns to the main session (interactive mode only).
+	 */
+	setMainView(view: ExtensionMainView | undefined): void;
+
+	/** Add, replace or remove (undefined) a section of the side panel opened with /diff. Sections render top to bottom by ascending order (default 0), above the built-in changes section. */
+	setSidePanelSection(
+		key: string,
+		factory: ((tui: TUI, theme: Theme) => Component & { dispose?(): void }) | undefined,
+		options?: { order?: number },
+	): void;
+
+	/** Whether the side panel opened with /diff is currently shown. Widgets may render less while it is open. */
+	isSidePanelOpen(): boolean;
 
 	/** Set the terminal window/tab title. */
 	setTitle(title: string): void;

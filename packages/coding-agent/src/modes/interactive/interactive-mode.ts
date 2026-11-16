@@ -59,6 +59,7 @@ import {
 	APP_NAME,
 	APP_TITLE,
 	CONFIG_DIR_NAME,
+	CREDNE_RELEASES_URL,
 	detectInstallChange,
 	getAgentDir,
 	getAuthPath,
@@ -84,6 +85,7 @@ import type {
 	EditorFactory,
 	ExtensionCommandContext,
 	ExtensionContext,
+	ExtensionMainView,
 	ExtensionRunner,
 	ExtensionUIContext,
 	ExtensionUIDialogOptions,
@@ -105,6 +107,7 @@ import {
 import { CredentialSynchronizationError } from "../../core/model-runtime.ts";
 import { DefaultPackageManager } from "../../core/package-manager.ts";
 import { compareProviders } from "../../core/preferred-providers.ts";
+import { PromptHistory } from "../../core/prompt-history.ts";
 import { findMatchingProviders } from "../../core/provider-matching.ts";
 import { RADIUS_PROVIDER_ID } from "../../core/radius.ts";
 import { planRadiusMcpServer } from "../../core/radius-mcp.ts";
@@ -130,6 +133,7 @@ import type { TruncationResult } from "../../core/tools/truncate.ts";
 import { hasTrustRequiringProjectResources, ProjectTrustStore } from "../../core/trust-manager.ts";
 import { getUsageCostBreakdown } from "../../core/usage-totals.ts";
 import { addMcpServerConfig } from "../../extensions/mcp/config.ts";
+import type { SubagentWidget } from "../../extensions/subagent/widget.ts";
 import { getChangelogPath, getNewEntries, normalizeChangelogLinks, parseChangelog } from "../../utils/changelog.ts";
 import { copyToClipboard, readClipboardFilePaths, readClipboardText } from "../../utils/clipboard.ts";
 import { extensionForImageMimeType, readClipboardImage } from "../../utils/clipboard-image.ts";
@@ -143,7 +147,7 @@ import { stripBom } from "../../utils/text.ts";
 import { ensureTool, type ToolStatus } from "../../utils/tools-manager.ts";
 import { checkForNewPiVersion, type LatestPiRelease } from "../../utils/version-check.ts";
 import { reportBug } from "./bug-report.ts";
-import { createChatViewport } from "./chat-viewport.ts";
+import { type ChatViewport, createChatViewport } from "./chat-viewport.ts";
 import { ArminComponent } from "./components/armin.ts";
 import { AssistantMessageComponent } from "./components/assistant-message.ts";
 import { BashExecutionComponent } from "./components/bash-execution.ts";
@@ -175,6 +179,11 @@ import { createLoginMenuSelector } from "./components/radius-login-selector.ts";
 import { ScopedModelsSelectorComponent } from "./components/scoped-models-selector.ts";
 import { SessionSelectorComponent } from "./components/session-selector.ts";
 import { SettingsSelectorComponent } from "./components/settings-selector.ts";
+import {
+	reserveFullscreenColumns,
+	reserveRegularColumns,
+	type TranscriptReservation,
+} from "./components/side-panel-layout.ts";
 import { SkillInvocationMessageComponent } from "./components/skill-invocation-message.ts";
 import {
 	BranchSummaryStatusIndicator,
@@ -191,11 +200,13 @@ import { TreeSelectorComponent } from "./components/tree-selector.ts";
 import { TrustSelectorComponent } from "./components/trust-selector.ts";
 import { UserMessageComponent } from "./components/user-message.ts";
 import { UserMessageSelectorComponent } from "./components/user-message-selector.ts";
+import { WarningGroupComponent } from "./components/warning-group.ts";
 import { editInExternalEditor } from "./external-editor.ts";
 import { refreshModelCatalogs } from "./model-catalog-refresh.ts";
 import { getModelSearchText } from "./model-search.ts";
 import { type BlockedStatus, ProgramStatusReporter } from "./program-status-reporter.ts";
 import { shareSession } from "./session-share.ts";
+import { SidePanelController } from "./side-panel-controller.ts";
 import {
 	getAvailableThemes,
 	getAvailableThemesWithPaths,
@@ -475,11 +486,15 @@ export class InteractiveMode {
 	private chatContainer: Container;
 	private documentContainer: Container;
 	private transcriptScrollView: TuiLayouts.ScrollView | undefined;
+	private chatViewport: ChatViewport | undefined;
 	private fullscreenLayoutRoot: Component | undefined;
+	private sidePanel: SidePanelController;
 	private pendingMessagesContainer: Container;
 	private statusContainer: Container;
 	private defaultEditor: CustomEditor;
 	private editor: ActiveEditor;
+	private promptHistory: PromptHistory;
+	private warningGroup: WarningGroupComponent | undefined;
 	private editorComponentFactory: EditorFactory | undefined;
 	private autocompleteProvider: AutocompleteProvider | undefined;
 	private autocompleteProviderWrappers: AutocompleteProviderFactory[] = [];
@@ -600,6 +615,9 @@ export class InteractiveMode {
 	private widgetContainerAbove!: Container;
 	private widgetContainerBelow!: Container;
 
+	// Extension view shown in place of the transcript (undefined = main session transcript)
+	private mainView: { view: ExtensionMainView; component: Component & { dispose?(): void } } | undefined;
+
 	// Custom footer from extension (undefined = use built-in footer)
 	private customFooter: (Component & { dispose?(): void }) | undefined = undefined;
 
@@ -679,6 +697,8 @@ export class InteractiveMode {
 			embedWorkingStatus: true,
 		});
 		this.editor = this.defaultEditor;
+		this.promptHistory = new PromptHistory(this.sessionManager.getCwd());
+		this.defaultEditor.setHistory(this.promptHistory.load());
 		this.editorContainer = new Container();
 		this.editorContainer.addChild(this.editor as Component);
 		this.footerDataProvider = new FooterDataProvider(this.sessionManager.getCwd());
@@ -686,6 +706,13 @@ export class InteractiveMode {
 		this.footer.setAutoCompactEnabled(this.session.autoCompactionEnabled);
 		this.footerContainer = new Container();
 		this.footerContainer.addChild(this.footer);
+		this.sidePanel = new SidePanelController({
+			ui: this.ui,
+			getCwd: () => this.sessionManager.getCwd(),
+			getCloseHint: () => keyText("app.sidePanel.toggle") || "/diff",
+			showStatus: (message) => this.showStatus(message),
+			reserveTranscriptColumns: (getWidth) => this.reserveTranscriptColumns(getWidth),
+		});
 
 		// Load hide thinking block setting
 		this.hideThinkingBlock = this.settingsManager.getHideThinkingBlock();
@@ -784,9 +811,10 @@ export class InteractiveMode {
 			};
 		}
 
-		const thinkingCommand = slashCommands.find((command) => command.name === "thinking");
-		if (thinkingCommand) {
-			thinkingCommand.getArgumentCompletions = (prefix: string): AutocompleteItem[] | null => {
+		for (const commandName of ["thinking", "effort"]) {
+			const command = slashCommands.find((candidate) => candidate.name === commandName);
+			if (!command) continue;
+			command.getArgumentCompletions = (prefix: string): AutocompleteItem[] | null => {
 				return createFuzzyAutocompleteItems(
 					this.session.getAvailableThinkingLevels(),
 					prefix,
@@ -925,7 +953,31 @@ export class InteractiveMode {
 		}
 	}
 
+	/** Free columns beside the transcript for the side panel. The input dock keeps the full width. */
+	private reserveTranscriptColumns(getWidth: () => number): TranscriptReservation {
+		if (this.renderer.mode === "fullscreen") {
+			if (!this.chatViewport) throw new Error("Fullscreen layout is not initialized");
+			return reserveFullscreenColumns(this.chatViewport, getWidth);
+		}
+		return reserveRegularColumns(
+			this.renderer,
+			{
+				transcript: [this.documentContainer, this.pendingMessagesContainer],
+				dock: [
+					this.statusContainer,
+					this.widgetContainerAbove,
+					this.editorContainer,
+					this.widgetContainerBelow,
+					this.footerContainer,
+				],
+			},
+			getWidth,
+		);
+	}
+
 	private stopInteractiveTui(fullscreenExitOutput: FullscreenExitOutput): void {
+		// The panel must not narrow the transcript that fullscreen exit prints.
+		this.sidePanel.close();
 		if (this.renderer.mode === "fullscreen" && fullscreenExitOutput === "transcript") {
 			while (this.renderer.hasOverlayEntries) this.renderer.hideOverlay();
 			this.switchTuiMode("regular", false, false);
@@ -937,7 +989,12 @@ export class InteractiveMode {
 	private switchTuiMode(mode: TuiMode, restoreProgress = true, startRenderer = true): boolean {
 		const previousUi = this.renderer;
 		if (mode === previousUi.mode) return true;
-		if (previousUi.hasOverlayEntries) return false;
+		// The panel is an overlay, which blocks the switch. It reopens on the new renderer.
+		const reopenSidePanel = this.sidePanel.suspend();
+		if (previousUi.hasOverlayEntries) {
+			reopenSidePanel();
+			return false;
+		}
 
 		const components = [...previousUi.children];
 		const focus = previousUi.getFocusedComponent();
@@ -984,6 +1041,7 @@ export class InteractiveMode {
 		) {
 			terminal.setProgress(true);
 		}
+		reopenSidePanel();
 		return true;
 	}
 
@@ -1018,6 +1076,7 @@ export class InteractiveMode {
 			scrollbarThumbStyle: (text) => theme.fg("scrollbarThumb", text),
 		});
 		this.transcriptScrollView = viewport.transcript;
+		this.chatViewport = viewport;
 		this.fullscreenLayoutRoot = viewport.root;
 		this.mountInteractiveTui(this.renderer, [
 			this.documentContainer,
@@ -1197,11 +1256,7 @@ export class InteractiveMode {
 		}
 
 		// Start version check asynchronously
-		checkForNewPiVersion(this.version).then((newRelease) => {
-			if (newRelease) {
-				this.showNewVersionNotification(newRelease);
-			}
-		});
+		checkForNewPiVersion(this.version).then((newRelease) => this.showNewVersionNotificationIfNeeded(newRelease));
 
 		// Start package update check asynchronously
 		this.checkForPackageUpdates()
@@ -1377,25 +1432,26 @@ export class InteractiveMode {
 		}
 
 		const lastVersion = this.settingsManager.getLastChangelogVersion();
-		const changelogPath = getChangelogPath();
-		const entries = parseChangelog(changelogPath);
+		// Once this installed release is acknowledged, avoid reading the changelog on every launch.
+		if (lastVersion === this.version) return undefined;
 
+		const entries = parseChangelog(getChangelogPath());
 		if (!lastVersion) {
 			// Fresh install - record the version, send telemetry, don't show changelog
-			this.settingsManager.setLastChangelogVersion(VERSION);
-			this.reportInstallTelemetry(VERSION);
+			this.settingsManager.setLastChangelogVersion(this.version);
+			this.reportInstallTelemetry(this.version);
 			return undefined;
 		}
 
-		const newEntries = getNewEntries(entries, lastVersion);
+		const newEntries = getNewEntries(entries, lastVersion, this.version);
 		if (!newEntries) {
 			// Unreadable saved version: show nothing and record the current one so later updates compare again
-			this.settingsManager.setLastChangelogVersion(VERSION);
+			this.settingsManager.setLastChangelogVersion(this.version);
 			return undefined;
 		}
+		this.settingsManager.setLastChangelogVersion(this.version);
 		if (newEntries.length > 0) {
-			this.settingsManager.setLastChangelogVersion(VERSION);
-			this.reportInstallTelemetry(VERSION);
+			this.reportInstallTelemetry(this.version);
 			return newEntries.map((e) => normalizeChangelogLinks(e.content, e)).join("\n\n");
 		}
 
@@ -1433,14 +1489,15 @@ export class InteractiveMode {
 				continue;
 			}
 
-			const newEntries = getNewEntries(parseChangelog(sourceInfo.changelogPath), lastVersion);
+			if (lastVersion === pkg.version) continue;
+			const newEntries = getNewEntries(parseChangelog(sourceInfo.changelogPath), lastVersion, pkg.version);
 			if (!newEntries) {
 				// Unreadable saved version: show nothing and record the current one so later updates compare again
 				this.settingsManager.setExtensionChangelogVersion(key, pkg.version);
 				continue;
 			}
+			this.settingsManager.setExtensionChangelogVersion(key, pkg.version);
 			if (newEntries.length > 0) {
-				this.settingsManager.setExtensionChangelogVersion(key, pkg.version);
 				const name = pkg.name || sourceInfo.source;
 				// Prefix each "## [x.y.z]" heading with the package name so entries render like Pi's own.
 				const markdown = newEntries
@@ -2039,24 +2096,6 @@ export class InteractiveMode {
 		}
 
 		if (showDiagnostics) {
-			const skillDiagnostics = skillsResult.diagnostics;
-			if (skillDiagnostics.length > 0) {
-				const warningLines = () => this.formatDiagnostics(skillDiagnostics, sourceInfos);
-				this.loadedResourcesContainer.addChild(
-					new ThemedText(() => `${theme.fg("warning", "[Skill warnings]")}\n${warningLines()}`, 0, 0),
-				);
-				this.loadedResourcesContainer.addChild(new Spacer(1));
-			}
-
-			const promptDiagnostics = promptsResult.diagnostics;
-			if (promptDiagnostics.length > 0) {
-				const warningLines = () => this.formatDiagnostics(promptDiagnostics, sourceInfos);
-				this.loadedResourcesContainer.addChild(
-					new ThemedText(() => `${theme.fg("warning", "[Prompt conflicts]")}\n${warningLines()}`, 0, 0),
-				);
-				this.loadedResourcesContainer.addChild(new Spacer(1));
-			}
-
 			const extensionDiagnostics: ResourceDiagnostic[] = [];
 			const extensionsResult = this.session.resourceLoader.getExtensions();
 			for (const error of extensionsResult.errors) {
@@ -2065,28 +2104,35 @@ export class InteractiveMode {
 			for (const warning of extensionsResult.warnings ?? []) {
 				extensionDiagnostics.push({ type: "warning", message: warning.warning, path: warning.path });
 			}
-
-			const commandDiagnostics = this.session.extensionRunner.getCommandDiagnostics();
-			extensionDiagnostics.push(...commandDiagnostics);
+			extensionDiagnostics.push(...this.session.extensionRunner.getCommandDiagnostics());
 			extensionDiagnostics.push(...this.getBuiltInCommandConflictDiagnostics(this.session.extensionRunner));
+			extensionDiagnostics.push(...this.session.extensionRunner.getShortcutDiagnostics());
 
-			const shortcutDiagnostics = this.session.extensionRunner.getShortcutDiagnostics();
-			extensionDiagnostics.push(...shortcutDiagnostics);
-
-			if (extensionDiagnostics.length > 0) {
-				const warningLines = () => this.formatDiagnostics(extensionDiagnostics, sourceInfos);
-				this.loadedResourcesContainer.addChild(
-					new ThemedText(() => `${theme.fg("warning", "[Extension issues]")}\n${warningLines()}`, 0, 0),
-				);
-				this.loadedResourcesContainer.addChild(new Spacer(1));
+			const warnings: string[] = [];
+			for (const [label, diagnostics] of [
+				["Skill warnings", skillsResult.diagnostics],
+				["Prompt conflicts", promptsResult.diagnostics],
+				["Extension issues", extensionDiagnostics],
+				["Theme conflicts", themesResult.diagnostics],
+			] as const) {
+				const errors = diagnostics.filter((diagnostic) => diagnostic.type === "error");
+				if (errors.length > 0) {
+					this.loadedResourcesContainer.addChild(
+						new ThemedText(
+							() => `${theme.fg("error", `[${label}]`)}\n${this.formatDiagnostics(errors, sourceInfos)}`,
+							0,
+							0,
+						),
+					);
+					this.loadedResourcesContainer.addChild(new Spacer(1));
+				}
+				const issues = diagnostics.filter((diagnostic) => diagnostic.type !== "error");
+				for (const issue of issues) {
+					warnings.push(`[${label}] ${this.formatDiagnostics([issue], sourceInfos).trimStart()}`);
+				}
 			}
-
-			const themeDiagnostics = themesResult.diagnostics;
-			if (themeDiagnostics.length > 0) {
-				const warningLines = () => this.formatDiagnostics(themeDiagnostics, sourceInfos);
-				this.loadedResourcesContainer.addChild(
-					new ThemedText(() => `${theme.fg("warning", "[Theme conflicts]")}\n${warningLines()}`, 0, 0),
-				);
+			if (warnings.length > 0) {
+				this.loadedResourcesContainer.addChild(new WarningGroupComponent(() => this.ui.requestRender(), warnings));
 				this.loadedResourcesContainer.addChild(new Spacer(1));
 			}
 		}
@@ -2216,6 +2262,8 @@ export class InteractiveMode {
 
 	private async rebindCurrentSession(options: { renderBeforeBind?: boolean } = {}): Promise<void> {
 		const session = this.session;
+		this.promptHistory = new PromptHistory(this.sessionManager.getCwd());
+		this.defaultEditor.setHistory(this.promptHistory.load());
 
 		this.unsubscribe?.();
 		this.unsubscribe = undefined;
@@ -2236,6 +2284,9 @@ export class InteractiveMode {
 		if (!options.renderBeforeBind) {
 			this.subscribeToAgent();
 		}
+
+		// A new session is active, at startup or after a switch: the side panel shows changes made from here on.
+		this.sidePanel.beginSession();
 
 		await this.updateAvailableProviderCount();
 		this.updateEditorBorderColor();
@@ -2337,6 +2388,7 @@ export class InteractiveMode {
 	private renderCurrentSessionState(): void {
 		this.loadedResourcesContainer.clear();
 		this.chatContainer.clear();
+		this.warningGroup = undefined;
 		this.pendingMessagesContainer.clear();
 		this.pendingBashComponents = [];
 		this.compactionQueuedMessages = [];
@@ -2603,7 +2655,9 @@ export class InteractiveMode {
 		this.clearExtensionTerminalInputListeners();
 		this.setExtensionFooter(undefined);
 		this.setExtensionHeader(undefined);
+		if (this.mainView) this.setExtensionMainView(undefined);
 		this.clearExtensionWidgets();
+		this.sidePanel.clearSections();
 		this.footerDataProvider.clearExtensionStatuses();
 		this.footer.invalidate();
 		this.autocompleteProviderWrappers = [];
@@ -2683,6 +2737,27 @@ export class InteractiveMode {
 		}
 
 		this.ui.requestRender();
+	}
+
+	/**
+	 * Show an extension view in place of the transcript, or restore the main session transcript.
+	 * The detached chat container keeps receiving session output, so switching back shows everything.
+	 */
+	private setExtensionMainView(view: ExtensionMainView | undefined): void {
+		this.mainView?.component.dispose?.();
+		this.mainView = undefined;
+		this.documentContainer.clear();
+		if (view) {
+			const component = view.component(this.ui, theme);
+			this.mainView = { view, component };
+			this.documentContainer.addChild(component);
+		} else {
+			this.documentContainer.addChild(this.headerContainer);
+			this.documentContainer.addChild(this.loadedResourcesContainer);
+			this.documentContainer.addChild(this.chatContainer);
+		}
+		this.transcriptScrollView?.scrollToEnd();
+		this.updateEditorBorderColor();
 	}
 
 	/**
@@ -2790,6 +2865,9 @@ export class InteractiveMode {
 			setWidget: (key, content, options) => this.setExtensionWidget(key, content, options),
 			setFooter: (factory) => this.setExtensionFooter(factory),
 			setHeader: (factory) => this.setExtensionHeader(factory),
+			setMainView: (view) => this.setExtensionMainView(view),
+			setSidePanelSection: (key, factory, options) => this.sidePanel.setSection(key, factory, options?.order),
+			isSidePanelOpen: () => this.sidePanel.isOpen,
 			setTitle: (title) => this.ui.terminal.setTitle(title),
 			custom: (factory, options) => this.showExtensionCustom(factory, options),
 			pasteToEditor: (text) => this.editor.handleInput(`\x1b[200~${text}\x1b[201~`),
@@ -3193,7 +3271,10 @@ export class InteractiveMode {
 		// Set up handlers on defaultEditor - they use this.editor for text access
 		// so they work correctly regardless of which editor is active
 		this.defaultEditor.onEscape = () => {
-			if (this.session.isStreaming) {
+			// While an extension view replaces the transcript, Escape returns to the main session first.
+			if (this.mainView) {
+				this.setExtensionMainView(undefined);
+			} else if (this.session.isStreaming) {
 				this.restoreQueuedMessagesToEditor({ abort: true });
 			} else if (this.session.isBashRunning) {
 				this.session.abortBash();
@@ -3231,6 +3312,14 @@ export class InteractiveMode {
 		// Global debug handler on TUI (works regardless of focus)
 		this.ui.onDebug = () => this.handleDebugCommand();
 		this.defaultEditor.onAction("app.model.select", () => this.showModelSelector());
+		this.defaultEditor.onAction("app.subagents.select", () => {
+			const widget = this.extensionWidgetsBelow.get("subagents") as SubagentWidget | undefined;
+			widget?.activate((data) => {
+				this.ui.setFocus(this.editor);
+				if (data !== undefined) this.editor.handleInput?.(data);
+				this.ui.requestRender();
+			});
+		});
 		this.defaultEditor.onAction("app.tools.expand", () => this.toggleToolOutputExpansion());
 		this.defaultEditor.onAction("app.thinking.toggle", () => this.toggleThinkingBlockVisibility());
 		this.defaultEditor.onAction("app.editor.external", () => void this.handleOpenExternalEditor());
@@ -3244,6 +3333,12 @@ export class InteractiveMode {
 		this.defaultEditor.onAction("app.session.tree", () => this.showTreeSelector());
 		this.defaultEditor.onAction("app.session.fork", () => this.showUserMessageSelector());
 		this.defaultEditor.onAction("app.session.resume", () => this.showSessionSelector());
+		this.defaultEditor.onAction("app.sidePanel.toggle", () => this.sidePanel.toggle());
+		// The navigation keys do nothing while the panel is closed.
+		this.defaultEditor.onAction("app.sidePanel.nextFile", () => this.sidePanel.selectFile(1));
+		this.defaultEditor.onAction("app.sidePanel.prevFile", () => this.sidePanel.selectFile(-1));
+		this.defaultEditor.onAction("app.sidePanel.scrollDown", () => this.sidePanel.scrollDiffPage(1));
+		this.defaultEditor.onAction("app.sidePanel.scrollUp", () => this.sidePanel.scrollDiffPage(-1));
 
 		this.defaultEditor.onChange = (text: string) => {
 			const wasBashMode = this.isBashMode;
@@ -3325,6 +3420,13 @@ export class InteractiveMode {
 		this.defaultEditor.onSubmit = async (text: string) => {
 			text = text.trim();
 			if (!text) return;
+			this.promptHistory.record(text);
+			this.editor.addToHistory?.(text);
+
+			if (this.mainView && !text.startsWith("/")) {
+				this.mainView.view.onSubmit(text);
+				return;
+			}
 
 			// Handle commands
 			if (text === "/settings") {
@@ -3343,8 +3445,16 @@ export class InteractiveMode {
 				await this.handleModelCommand(searchTerm);
 				return;
 			}
-			if (text === "/thinking" || text.startsWith("/thinking ")) {
-				const searchTerm = text.startsWith("/thinking ") ? text.slice(10).trim() : undefined;
+			if (
+				text === "/thinking" ||
+				text.startsWith("/thinking ") ||
+				text === "/effort" ||
+				text.startsWith("/effort ")
+			) {
+				const commandName = text.startsWith("/effort") ? "/effort" : "/thinking";
+				const searchTerm = text.startsWith(`${commandName} `)
+					? text.slice(commandName.length + 1).trim()
+					: undefined;
 				this.editor.setText("");
 				this.handleThinkingCommand(searchTerm);
 				return;
@@ -3382,6 +3492,11 @@ export class InteractiveMode {
 			}
 			if (text === "/session") {
 				this.handleSessionCommand();
+				this.editor.setText("");
+				return;
+			}
+			if (text === "/diff") {
+				this.sidePanel.toggle();
 				this.editor.setText("");
 				return;
 			}
@@ -3478,7 +3593,6 @@ export class InteractiveMode {
 						this.editor.setText(text);
 						return;
 					}
-					this.editor.addToHistory?.(text);
 					await this.handleBashCommand(command, isExcluded);
 					this.isBashMode = false;
 					this.updateEditorBorderColor();
@@ -3489,7 +3603,6 @@ export class InteractiveMode {
 			// Queue input during compaction (extension commands execute immediately)
 			if (this.session.isCompacting) {
 				if (this.isExtensionCommand(text)) {
-					this.editor.addToHistory?.(text);
 					this.editor.setText("");
 					await this.session.prompt(text);
 				} else {
@@ -3501,7 +3614,6 @@ export class InteractiveMode {
 			// If streaming, use prompt() with steer behavior
 			// This handles extension commands (execute immediately), prompt template expansion, and queueing
 			if (this.session.isStreaming) {
-				this.editor.addToHistory?.(text);
 				this.editor.setText("");
 				await this.session.prompt(text, { streamingBehavior: "steer" });
 				this.updatePendingMessagesDisplay();
@@ -3518,7 +3630,6 @@ export class InteractiveMode {
 			} else {
 				this.pendingUserInputs.push(text);
 			}
-			this.editor.addToHistory?.(text);
 		};
 	}
 
@@ -3535,6 +3646,7 @@ export class InteractiveMode {
 
 		this.footer.invalidate();
 		this.programStatus.handleEvent(event);
+		this.sidePanel.handleAgentEvent(event.type);
 
 		switch (event.type) {
 			case "agent_start":
@@ -3943,13 +4055,15 @@ export class InteractiveMode {
 
 	/** Show a managed-tool status update in the chat. */
 	private showManagedToolStatus(status: ToolStatus): void {
+		if (status.type === "warning") {
+			this.showWarning(status.message);
+			return;
+		}
 		if (!this.managedToolStatusStarted) {
 			this.chatContainer.addChild(new Spacer(1));
 			this.managedToolStatusStarted = true;
 		}
-		const message = status.type === "warning" ? `Warning: ${status.message}` : status.message;
-		const color = status.type === "warning" ? "warning" : "dim";
-		this.chatContainer.addChild(new ThemedText(() => theme.fg(color, message), 1, 0));
+		this.chatContainer.addChild(new ThemedText(() => theme.fg("dim", status.message), 1, 0));
 		this.lastStatusSpacer = undefined;
 		this.lastStatusText = undefined;
 		this.ui.requestRender();
@@ -4391,9 +4505,10 @@ export class InteractiveMode {
 
 	renderInitialMessages(): void {
 		const entries = this.sessionManager.buildContextEntries();
+		// Use transcript prompts only as a fallback for sessions without saved editor history.
 		this.renderSessionEntries(entries, {
 			updateFooter: true,
-			populateHistory: true,
+			populateHistory: this.promptHistory.load().length === 0,
 		});
 		this.renderProjectTrustWarningIfNeeded();
 
@@ -4661,9 +4776,12 @@ export class InteractiveMode {
 		if (!text) return;
 
 		// Queue input during compaction (extension commands execute immediately)
+		if (this.session.isCompacting || this.session.isStreaming) {
+			this.promptHistory.record(text);
+			this.editor.addToHistory?.(text);
+		}
 		if (this.session.isCompacting) {
 			if (this.isExtensionCommand(text)) {
-				this.editor.addToHistory?.(text);
 				this.editor.setText("");
 				await this.session.prompt(text);
 			} else {
@@ -4675,7 +4793,6 @@ export class InteractiveMode {
 		// Alt+Enter queues a follow-up message (waits until agent finishes)
 		// This handles extension commands (execute immediately), prompt template expansion, and queueing
 		if (this.session.isStreaming) {
-			this.editor.addToHistory?.(text);
 			this.editor.setText("");
 			await this.session.prompt(text, { streamingBehavior: "followUp" });
 			this.updatePendingMessagesDisplay();
@@ -4698,12 +4815,21 @@ export class InteractiveMode {
 	}
 
 	private updateEditorBorderColor(): void {
-		if (this.isBashMode) {
+		// While an extension view is shown, its color marks the input box as addressed to that view.
+		const view = this.mainView?.view;
+		const viewColor = view?.color ?? "accent";
+		if (view) {
+			this.editor.borderColor = (text) => theme.fg(viewColor, text);
+		} else if (this.isBashMode) {
 			this.editor.borderColor = theme.getBashModeBorderColor();
 		} else {
 			const level = this.session.thinkingLevel || "off";
 			this.editor.borderColor = theme.getThinkingBorderColor(level);
 		}
+		this.defaultEditor.setBorderBadge(
+			view ? theme.fg(viewColor, theme.inverse(theme.bold(` @${view.label} `))) : undefined,
+		);
+		this.defaultEditor.placeholder = view ? theme.fg("dim", `Message @${view.label}…`) : undefined;
 		this.activeStatusIndicator?.invalidate();
 		this.ui.requestRender();
 	}
@@ -4721,7 +4847,7 @@ export class InteractiveMode {
 
 	private async cycleModel(direction: "forward" | "backward"): Promise<void> {
 		try {
-			const result = await this.session.cycleModel(direction);
+			const result = await this.session.cycleModel(direction, { persist: true });
 			if (result === undefined) {
 				const msg = this.session.scopedModels.length > 0 ? "Only one model in scope" : "Only one model available";
 				this.showStatus(msg);
@@ -4813,16 +4939,33 @@ export class InteractiveMode {
 	}
 
 	showWarning(warningMessage: string): void {
-		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(new ThemedText(() => theme.fg("warning", `Warning: ${warningMessage}`), 1, 0));
-		this.ui.requestRender();
+		if (!this.warningGroup || !this.chatContainer.children.includes(this.warningGroup)) {
+			this.chatContainer.addChild(new Spacer(1));
+			this.warningGroup = new WarningGroupComponent(() => this.ui.requestRender());
+			this.chatContainer.addChild(this.warningGroup);
+		}
+		this.warningGroup.addWarning(warningMessage);
+	}
+
+	/** Show an automatic update notice at most once per release, acknowledging it only after it is displayed. */
+	private showNewVersionNotificationIfNeeded(release: LatestPiRelease | undefined): void {
+		if (
+			!release ||
+			!this.isInitialized ||
+			this.settingsManager.getLastUpdateNotificationVersion() === release.version
+		) {
+			return;
+		}
+		this.showNewVersionNotification(release);
+		this.settingsManager.setLastUpdateNotificationVersion(release.version);
 	}
 
 	showNewVersionNotification(release: LatestPiRelease): void {
 		const updateInstruction = () =>
-			theme.fg("muted", `New version ${release.version} is available. Run `) +
-			theme.fg("accent", `${APP_NAME} update`);
-		const changelogUrl = "https://pi.dev/changelog";
+			theme.fg("muted", `New version ${release.version} is available. Get Credne from the release below, or run `) +
+			theme.fg("accent", `${APP_NAME} update`) +
+			theme.fg("muted", " for update instructions.");
+		const changelogUrl = CREDNE_RELEASES_URL;
 		const changelogLine = () => {
 			const changelogLink = getCapabilities().hyperlinks
 				? hyperlink(theme.fg("accent", changelogUrl), changelogUrl)
@@ -4950,7 +5093,6 @@ export class InteractiveMode {
 
 	private queueCompactionMessage(text: string, mode: "steer" | "followUp"): void {
 		this.compactionQueuedMessages.push({ text, mode });
-		this.editor.addToHistory?.(text);
 		this.editor.setText("");
 		this.updatePendingMessagesDisplay();
 		this.showStatus("Queued message for after compaction");
@@ -5392,7 +5534,7 @@ export class InteractiveMode {
 		const model = await this.findExactModelMatch(searchTerm);
 		if (model) {
 			try {
-				await this.session.setModel(model, { persist: false });
+				await this.session.setModel(model, { persist: true });
 				this.footer.invalidate();
 				this.updateEditorBorderColor();
 				this.showStatus(`Model: ${model.id}`);
@@ -5554,7 +5696,7 @@ export class InteractiveMode {
 				this.session.model,
 				this.session.modelRuntime,
 				this.session.scopedModels,
-				(model) => selectModel(model, false),
+				(model) => selectModel(model, true),
 				() => {
 					done();
 					this.ui.requestRender();

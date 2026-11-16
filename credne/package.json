@@ -1,6 +1,6 @@
 {
 	"name": "@neilhuang007/credne",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"description": "Pi-based coding agent that pools Claude and ChatGPT subscriptions, Claude API credits and API keys through an embedded CLIProxyAPI broker",
 	"type": "module",
 	"private": true,

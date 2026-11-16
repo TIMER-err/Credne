@@ -26,9 +26,9 @@ Keep `auth.json` and any credential commands private. Project settings and exten
 
 ## Select a model
 
-Run `/model` to search available models. The picker shows models whose providers have usable authentication. Press `Ctrl+S` on a model to save it as the default for new sessions.
+Run `/model` to search available models. The picker shows models whose providers have usable authentication. Selecting a model, entering `/model <name>`, or cycling models remembers the model and provider/account for new sessions across projects. `Ctrl+S` also saves the selection. Explicit CLI options and project settings take precedence over the saved default.
 
-Run `/thinking` to select the thinking level for the current model. Press `Ctrl+S` there to save the startup level. Pi limits the choices to levels supported by the selected model.
+Run `/thinking [level]` or `/effort [level]` to set the current model's reasoning level. Without a level, either command opens a selector limited to levels supported by the selected model. An explicit level applies to the current session; press `Ctrl+S` in the selector to save the startup default.
 
 `Ctrl+P` cycles through available models. Use `/scoped-models` to control that cycle and save the selection, or configure model patterns through [Settings](settings.md#model-cycling).
 

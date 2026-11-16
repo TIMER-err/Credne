@@ -39,6 +39,23 @@ export interface BrokerAccount {
 	modelCount: number;
 }
 
+export interface BrokerQuotaWindow {
+	label: string;
+	usedPercent: number;
+	resetAt?: string;
+}
+
+export interface BrokerCredit {
+	label: string;
+	amount?: number;
+	unit: string;
+	unlimited: boolean;
+}
+
+export type BrokerUsage =
+	| { status: "available"; windows: BrokerQuotaWindow[]; credits: BrokerCredit[] }
+	| { status: "unavailable" | "unsupported"; reason: string; windows: []; credits: [] };
+
 /** A model an account or pool can serve, as reported by CLIProxyAPI's registry. */
 export interface BrokerModel {
 	id: string;
@@ -143,6 +160,10 @@ export class BrokerClient {
 
 	async accountModels(key: string, signal?: AbortSignal): Promise<BrokerModel[]> {
 		return parseModels(field(await this.request("GET", `/accounts/${key}/models`, undefined, signal), "models"));
+	}
+
+	async accountUsage(key: string, signal?: AbortSignal): Promise<BrokerUsage> {
+		return parseUsage(await this.request("GET", `/accounts/${encodeURIComponent(key)}/usage`, undefined, signal));
 	}
 
 	async setDisabled(key: string, disabled: boolean): Promise<void> {
@@ -421,6 +442,57 @@ function parseAccounts(data: unknown): BrokerAccount[] {
 			},
 		];
 	});
+}
+
+function parseUsage(data: unknown): BrokerUsage {
+	const status = field(data, "status");
+	if (status === "unavailable" || status === "unsupported") {
+		return {
+			status,
+			reason: optionalString(data, "reason") ?? "Provider usage is not available.",
+			windows: [],
+			credits: [],
+		};
+	}
+	const rawWindows = field(data, "windows");
+	const rawCredits = field(data, "credits");
+	if (status !== "available" || !Array.isArray(rawWindows) || !Array.isArray(rawCredits)) {
+		throw new BrokerError("Broker returned invalid usage data");
+	}
+	const windows = rawWindows.map((entry): BrokerQuotaWindow => {
+		const label = optionalString(entry, "label");
+		const usedPercent = optionalNumber(entry, "usedPercent");
+		const resetAt = optionalString(entry, "resetAt");
+		if (
+			!label ||
+			usedPercent === undefined ||
+			usedPercent < 0 ||
+			usedPercent > 100 ||
+			(resetAt && !Number.isFinite(Date.parse(resetAt)))
+		) {
+			throw new BrokerError("Broker returned an invalid quota window");
+		}
+		return { label, usedPercent, resetAt };
+	});
+	const credits = rawCredits.map((entry): BrokerCredit => {
+		const label = optionalString(entry, "label");
+		const unit = optionalString(entry, "unit");
+		const amount = optionalNumber(entry, "amount");
+		const unlimited = field(entry, "unlimited") === true;
+		if (!label || !unit || (amount === undefined && !unlimited) || (amount !== undefined && amount < 0)) {
+			throw new BrokerError("Broker returned invalid credit data");
+		}
+		return { label, unit, amount, unlimited };
+	});
+	if (windows.length === 0 && credits.length === 0) {
+		return {
+			status: "unavailable",
+			reason: "Provider did not report quota windows or credits.",
+			windows: [],
+			credits: [],
+		};
+	}
+	return { status, windows, credits };
 }
 
 function parseKind(value: unknown): BrokerAccountKind {

@@ -9,6 +9,7 @@ import type { AutocompleteProviderFactory } from "../src/core/extensions/types.t
 import type { QuietStartup } from "../src/core/settings-manager.ts";
 import type { SourceInfo } from "../src/core/source-info.ts";
 import type { AuthSelectorProvider } from "../src/modes/interactive/components/oauth-selector.ts";
+import { WarningGroupComponent } from "../src/modes/interactive/components/warning-group.ts";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
 import { initTheme } from "../src/modes/interactive/theme/theme.ts";
 
@@ -131,15 +132,17 @@ describe("InteractiveMode.showManagedToolStatus", () => {
 			lastStatusText: undefined,
 		};
 		const showManagedToolStatus = (InteractiveMode as any).prototype.showManagedToolStatus;
+		fakeThis.showWarning = (InteractiveMode as any).prototype.showWarning.bind(fakeThis);
 
 		showManagedToolStatus.call(fakeThis, { type: "info", message: "fd downloading" });
 		showManagedToolStatus.call(fakeThis, { type: "info", message: "rg downloading" });
 		showManagedToolStatus.call(fakeThis, { type: "warning", message: "rg failed" });
 
-		expect(fakeThis.chatContainer.children).toHaveLength(4);
-		expect(normalizeRenderedOutput(fakeThis.chatContainer)).toBe(
-			"fd downloading\n rg downloading\n Warning: rg failed",
-		);
+		expect(fakeThis.chatContainer.children).toHaveLength(5);
+		const output = normalizeRenderedOutput(fakeThis.chatContainer);
+		expect(output).toContain("fd downloading\n rg downloading");
+		expect(output).toContain("Warnings (1)");
+		expect(output).not.toContain("rg failed");
 	});
 });
 
@@ -189,6 +192,7 @@ describe("InteractiveMode pending user bash output", () => {
 			session: { getSteeringMessages: () => ["steer"], getFollowUpMessages: () => [] },
 			footer: { invalidate: vi.fn() },
 			programStatus: { handleEvent: vi.fn() },
+			sidePanel: { handleAgentEvent: vi.fn() },
 			ui: { requestRender: vi.fn() },
 			showStatus: vi.fn(),
 			checkShutdownRequested: vi.fn(async () => {}),
@@ -488,6 +492,7 @@ describe("InteractiveMode.showExtensionCustom", () => {
 			setExtensionFooter: vi.fn(),
 			setExtensionHeader: vi.fn(),
 			clearExtensionWidgets: vi.fn(),
+			sidePanel: { clearSections: vi.fn(), scheduleRefresh: vi.fn() },
 			footerDataProvider: { clearExtensionStatuses: vi.fn() },
 			footer: { invalidate: vi.fn() },
 			setCustomEditorComponent: vi.fn(),
@@ -777,6 +782,7 @@ describe("InteractiveMode.showLoadedResources", () => {
 			toolOutputExpanded: options.toolOutputExpanded ?? false,
 			loadedResourcesContainer: new Container(),
 			chatContainer: new Container(),
+			ui: { requestRender: vi.fn() },
 			settingsManager: {
 				getQuietStartup: () => options.quietStartup,
 			},
@@ -1502,6 +1508,23 @@ describe("InteractiveMode.showLoadedResources", () => {
 		expect((InteractiveMode as any).prototype.shouldShowStartupDetails.call(verbose)).toBe(true);
 	});
 
+	test("keeps resource errors visible without expanding warning details", () => {
+		const fakeThis = createShowLoadedResourcesThis({
+			quietStartup: true,
+			skillDiagnostics: [
+				{ type: "error", message: "broken skill" },
+				{ type: "warning", message: "duplicate skill name" },
+			],
+		});
+		(InteractiveMode as any).prototype.showLoadedResources.call(fakeThis, { showDiagnosticsWhenQuiet: true });
+
+		const output = renderAll(fakeThis.loadedResourcesContainer);
+		expect(output).toContain("[Skill warnings]");
+		expect(output).toContain("diagnostics");
+		expect(output).toContain("Warnings (1)");
+		expect(output).not.toContain("duplicate skill name");
+	});
+
 	test("still shows diagnostics on quiet startup when requested", () => {
 		const fakeThis = createShowLoadedResourcesThis({
 			quietStartup: true,
@@ -1515,7 +1538,14 @@ describe("InteractiveMode.showLoadedResources", () => {
 		});
 
 		const output = renderAll(fakeThis.loadedResourcesContainer);
-		expect(output).toContain("[Skill warnings]");
+		expect(output).toContain("Warnings (1)");
+		expect(output).not.toContain("duplicate skill name");
 		expect(output).not.toContain("[Skills]");
+		const group = fakeThis.loadedResourcesContainer.children.find(
+			(child: Component) => child instanceof WarningGroupComponent,
+		) as WarningGroupComponent;
+		group.setExpanded(true);
+		expect(renderAll(fakeThis.loadedResourcesContainer)).toContain("[Skill warnings]");
+		expect(renderAll(fakeThis.loadedResourcesContainer)).toContain("[Skill warnings] diagnostics");
 	});
 });

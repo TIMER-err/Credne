@@ -138,6 +138,7 @@ describe("createInteractiveTui", () => {
 			renderer: ReturnType<typeof createInteractiveTui>;
 			ui: TUI;
 			fullscreenLayoutRoot: Component;
+			sidePanel: { close(): void; suspend(): () => void };
 			options: { tuiMode?: TuiMode };
 			themeController: { rebindTui: () => void };
 			extensionTerminalInputSubscriptions: Set<never>;
@@ -151,6 +152,7 @@ describe("createInteractiveTui", () => {
 			renderer,
 			ui: undefined as unknown as TUI,
 			fullscreenLayoutRoot: component,
+			sidePanel: { close: () => {}, suspend: () => () => {} },
 			options: { tuiMode: "regular" as TuiMode },
 			themeController: { rebindTui: () => {} },
 			extensionTerminalInputSubscriptions: new Set<never>(),

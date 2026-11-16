@@ -63,6 +63,26 @@ describe("status indicators", () => {
 		indicator.dispose();
 	});
 
+	it("right-aligns the main-view badge after the working status, within the border width", () => {
+		initTheme("dark");
+		const tui = { requestRender: vi.fn(), terminal: { rows: 10 } } as unknown as TUI;
+		const editor = new CustomEditor(tui, getEditorTheme(), KeybindingsManager.create(), {
+			embedWorkingStatus: true,
+		});
+		editor.setBorderBadge("[explorer]");
+		expect(stripAnsi(editor.render(30)[0]!)).toBe(`${"─".repeat(20)}[explorer]`);
+		const indicator = new WorkingStatusIndicator(tui, "Working");
+		try {
+			editor.setWorkingStatusIndicator(indicator);
+			expect(stripAnsi(editor.render(40)[0]!)).toBe(`── ⠋ Working ${"─".repeat(17)}[explorer]`);
+			for (const width of [1, 4, 10, 20, 40]) expect(visibleWidth(editor.render(width)[0]!)).toBe(width);
+			editor.setBorderBadge(undefined);
+			expect(stripAnsi(editor.render(40)[0]!)).toBe(`── ⠋ Working ${"─".repeat(27)}`);
+		} finally {
+			indicator.dispose();
+		}
+	});
+
 	it("embeds compaction, summary, and retry labels within the border width", () => {
 		initTheme("dark");
 		vi.useFakeTimers();

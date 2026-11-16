@@ -375,6 +375,8 @@ export class Editor implements Component, Focusable {
 	public onSubmit?: (text: string) => void;
 	public onChange?: (text: string) => void;
 	public disableSubmit: boolean = false;
+	/** Styled hint shown after the cursor while the editor is empty. */
+	public placeholder: string | undefined;
 
 	constructor(tui: TUI, theme: EditorTheme, options: EditorOptions = {}) {
 		this.tui = tui;
@@ -440,6 +442,17 @@ export class Editor implements Component, Focusable {
 		if (this.history.length > 100) {
 			this.history.pop();
 		}
+	}
+
+	/** Replace prompt history in oldest-to-newest order, retaining an unsent draft. */
+	setHistory(prompts: readonly string[]): void {
+		if (this.historyDraft) {
+			this.state = this.historyDraft;
+			this.onChange?.(this.getText());
+		}
+		this.exitHistoryBrowsing();
+		this.history = [];
+		for (const prompt of prompts) this.addToHistory(prompt);
 	}
 
 	private isEditorEmpty(): boolean {
@@ -606,6 +619,12 @@ export class Editor implements Component, Focusable {
 						cursorInPadding = true;
 					}
 				}
+			}
+
+			if (this.placeholder && layoutLine.hasCursor && this.state.lines.length === 1 && !this.state.lines[0]) {
+				const hint = sliceByColumn(this.placeholder, 0, Math.max(0, contentWidth - lineVisibleWidth), true);
+				displayText += hint;
+				lineVisibleWidth += visibleWidth(hint);
 			}
 
 			// Calculate padding based on actual visible width

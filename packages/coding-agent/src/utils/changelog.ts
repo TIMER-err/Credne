@@ -1,5 +1,6 @@
 import path from "node:path";
 import { existsSync, readFileSync } from "fs";
+import { CREDNE_REPO_URL } from "../config.ts";
 
 export interface ChangelogEntry {
 	major: number;
@@ -8,9 +9,11 @@ export interface ChangelogEntry {
 	content: string;
 }
 
-const GITHUB_REPO = "earendil-works/pi";
+const GITHUB_REPO = CREDNE_REPO_URL.slice("https://github.com/".length);
 const CHANGELOG_LINK_BASE_PATH = "packages/coding-agent";
-const LEGACY_REPO_RE = /^https:\/\/github\.com\/(?:badlogic|earendil-works)\/pi-mono(?=\/|$)/;
+const UPSTREAM_SOURCE_RE =
+	/^https:\/\/github\.com\/(?:badlogic\/pi-mono|earendil-works\/(?:pi-mono|pi))\/(blob|tree)\//;
+const LEGACY_ATTRIBUTION_RE = /^https:\/\/github\.com\/(?:badlogic|earendil-works)\/pi-mono\/(issues|pull)\//;
 const URL_SCHEME_RE = /^[a-z][a-z0-9+.-]*:/i;
 const INLINE_MARKDOWN_LINK_RE = /(!?\[[^\]\n]+\]\()([^\s)]+)((?:\s+[^)]*)?\))/g;
 
@@ -67,8 +70,10 @@ function isDirectoryTarget(originalPath: string, repositoryPath: string): boolea
 }
 
 function normalizeChangelogLinkTarget(target: string, tag: string): string {
-	let canonicalTarget = target.replace(LEGACY_REPO_RE, `https://github.com/${GITHUB_REPO}`);
-	const repoUrl = `https://github.com/${GITHUB_REPO}`;
+	const repoUrl = CREDNE_REPO_URL;
+	let canonicalTarget = target
+		.replace(UPSTREAM_SOURCE_RE, `${repoUrl}/$1/`)
+		.replace(LEGACY_ATTRIBUTION_RE, "https://github.com/earendil-works/pi/$1/");
 
 	for (const route of ["blob", "tree"]) {
 		for (const branch of ["main", "master"]) {
@@ -179,7 +184,11 @@ export function compareVersions(v1: ChangelogEntry, v2: ChangelogEntry): number 
 /**
  * Get entries newer than lastVersion, or undefined when lastVersion has no major.minor.patch to compare against
  */
-export function getNewEntries(entries: ChangelogEntry[], lastVersion: string): ChangelogEntry[] | undefined {
+export function getNewEntries(
+	entries: ChangelogEntry[],
+	lastVersion: string,
+	installedVersion?: string,
+): ChangelogEntry[] | undefined {
 	// Read only the leading major.minor.patch, like the changelog headings, so a prerelease such as
 	// 0.1.5-20261020.7 counts as 0.1.5 and its notes are not shown again on every launch (#11703).
 	// Alternatives considered: plain string comparison orders 0.10.0 before 0.9.0; numeric localeCompare
@@ -194,7 +203,18 @@ export function getNewEntries(entries: ChangelogEntry[], lastVersion: string): C
 		content: "",
 	};
 
-	return entries.filter((entry) => compareVersions(entry, last) > 0);
+	const installedParts = installedVersion?.trim().match(/^v?(\d+)\.(\d+)\.(\d+)/);
+	const installed = installedParts
+		? {
+				major: Number(installedParts[1]),
+				minor: Number(installedParts[2]),
+				patch: Number(installedParts[3]),
+				content: "",
+			}
+		: undefined;
+	return entries.filter(
+		(entry) => compareVersions(entry, last) > 0 && (!installed || compareVersions(entry, installed) <= 0),
+	);
 }
 
 // Re-export getChangelogPath from paths.ts for convenience

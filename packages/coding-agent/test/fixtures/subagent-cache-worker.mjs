@@ -62,6 +62,7 @@ async function run(message) {
 	scenario = JSON.parse(message);
 	record("waiting", { argv: process.argv.slice(2), agentType: process.env.PI_SUBAGENT_AGENT_NAME });
 	let key = scenario.key ?? "conversation";
+	for (const usage of scenario.warmDuringWait ?? []) emitWarmUsage(usage);
 	await request({ type: "cache_wait", key });
 	if (isAborted) return;
 	record("request", { key });
@@ -86,7 +87,20 @@ async function run(message) {
 	for (const usage of scenario.usage ?? [undefined])
 		emit({ type: "message_end", message: assistant(scenario.fail ? "error" : "stop", usage) });
 	for (const usage of scenario.warmAfter ?? []) emitWarmUsage(usage);
+	for (const kind of scenario.extraEntries ?? []) {
+		const usage = assistant().usage;
+		usage.input = 2;
+		usage.cost.total = 0.25;
+		if (kind === "toolResult") {
+			const message = { role: "toolResult", toolCallId: "fixture", toolName: "fixture", content: [], usage, isError: false, timestamp: 0 };
+			emit({ type: "entry_appended", entry: { type: "message", message } });
+			emit({ type: "message_end", message });
+		} else {
+			emit({ type: "entry_appended", entry: { type: kind, usage } });
+		}
+	}
 	emit({ type: "agent_settled", aborted: false });
+	for (const usage of scenario.idleWarmAfter ?? []) setTimeout(() => emitWarmUsage(usage), 25);
 }
 
 readline.createInterface({ input: process.stdin }).on("line", (line) => {

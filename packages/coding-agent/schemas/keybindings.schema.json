@@ -231,6 +231,22 @@
       "$ref": "#/$defs/KeybindingValue",
       "description": "Open model selector"
     },
+    "app.accounts.manage": {
+      "$ref": "#/$defs/KeybindingValue",
+      "description": "Manage the selected account"
+    },
+    "app.accounts.model": {
+      "$ref": "#/$defs/KeybindingValue",
+      "description": "Choose a model on the selected account or pool"
+    },
+    "app.accounts.refresh": {
+      "$ref": "#/$defs/KeybindingValue",
+      "description": "Refresh selected account usage"
+    },
+    "app.subagents.select": {
+      "$ref": "#/$defs/KeybindingValue",
+      "description": "Select agents below an empty prompt"
+    },
     "app.tools.expand": {
       "$ref": "#/$defs/KeybindingValue",
       "description": "Toggle tool output"
@@ -262,6 +278,26 @@
     "app.clipboard.pasteImage": {
       "$ref": "#/$defs/KeybindingValue",
       "description": "Paste files on macOS, images, or text from clipboard"
+    },
+    "app.sidePanel.toggle": {
+      "$ref": "#/$defs/KeybindingValue",
+      "description": "Toggle the side panel"
+    },
+    "app.sidePanel.nextFile": {
+      "$ref": "#/$defs/KeybindingValue",
+      "description": "Side panel: select next changed file"
+    },
+    "app.sidePanel.prevFile": {
+      "$ref": "#/$defs/KeybindingValue",
+      "description": "Side panel: select previous changed file"
+    },
+    "app.sidePanel.scrollDown": {
+      "$ref": "#/$defs/KeybindingValue",
+      "description": "Side panel: scroll the diff down"
+    },
+    "app.sidePanel.scrollUp": {
+      "$ref": "#/$defs/KeybindingValue",
+      "description": "Side panel: scroll the diff up"
     },
     "app.session.new": {
       "$ref": "#/$defs/KeybindingValue",

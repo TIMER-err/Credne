@@ -1,8 +1,12 @@
 // Coordinates persistent workers through a shared session queue and authenticated message routing.
 import { randomUUID } from "node:crypto";
+import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import { Type } from "typebox";
 import type { ExtensionAPI, ExtensionContext } from "../../core/extensions/types.ts";
 import type { ReadonlySessionManager } from "../../core/session-manager.ts";
+import { SUBAGENT_USAGE_ENTRY, type SubagentUsageSnapshot } from "../../core/session-usage.ts";
+import type { UsageTotals } from "../../core/usage-totals.ts";
+import type { ThemeColor } from "../../modes/interactive/theme/theme-tokens.ts";
 import { type BackgroundJob, BackgroundJobManager } from "./background-job-manager.ts";
 import { PrefixWarmup } from "./prefix-warmup.ts";
 import {
@@ -14,20 +18,28 @@ import {
 	type ResolvedAgent,
 	type SingleResult,
 	type SubagentDetails,
+	type UsageStats,
 	type WorkerSession,
 } from "./runner.ts";
+import { SubagentSection, SubagentWidget, sharedWorkerSpinner } from "./widget.ts";
 import type { RequestParent, WorkerRequest } from "./worker-channel.ts";
+import { workerColorAt } from "./worker-color.ts";
+import { showWorkerView } from "./worker-view.ts";
 
-export interface SpawnInput {
-	name: string;
+export interface AssignmentInput {
 	task: string;
+	beforeStart?: () => string;
+	onResult?: (result: SingleResult, workerId: string) => void | Promise<void>;
+	beforeResume?: () => void;
+}
+
+export interface SpawnInput extends AssignmentInput {
+	name: string;
 	defaults: DispatchDefaults;
 	resolved: ResolvedAgent;
 	step?: number;
 	onUpdate?: OnUpdateCallback;
 	makeDetails?: (results: SingleResult[]) => SubagentDetails;
-	onResult?: (result: SingleResult, workerId: string) => void | Promise<void>;
-	beforeResume?: () => void;
 }
 
 export interface WorkerSummary {
@@ -36,26 +48,49 @@ export interface WorkerSummary {
 	task: string;
 	status: "queued" | "running" | "completed" | "failed" | "interrupted" | "cancelled";
 	inboxCount: number;
+	assignmentCount: number;
 }
+
+export interface WorkerView extends WorkerSummary {
+	/** Stable for the life of the team; assigned in spawn order. */
+	color: ThemeColor;
+	agentType: string;
+	model?: string;
+	reasoningEffort?: ThinkingLevel;
+	usage: UsageStats;
+	elapsedMs: number;
+	runs: SingleResult[];
+}
+
+/** What the panel sections need to name a worker: cheap to look up, unlike a full view. */
+export type WorkerIdentity = Pick<WorkerView, "id" | "name" | "color">;
 
 interface Worker {
 	id: string;
+	color: ThemeColor;
 	input: SpawnInput;
 	session: WorkerSession;
 	status: WorkerSummary["status"];
 	inbox: string[];
+	assignments: WorkerRun[];
 	run?: WorkerRun;
 	cancellation?: Promise<void>;
 	hasStarted: boolean;
+	runs: SingleResult[];
+	elapsedMs: number;
+	startedAt?: number;
 }
 
 interface WorkerRun {
 	worker: Worker;
+	input: SpawnInput;
+	kind: "assignment" | "continuation";
 	task: string;
 	queueId?: string;
 	resolve: (result: SingleResult) => void;
 	result: Promise<SingleResult>;
 	isInitial: boolean;
+	resultIndex: number;
 }
 
 interface TeamOwner {
@@ -73,7 +108,32 @@ export function getWorkerTeam(pi: ExtensionAPI, ctx: ExtensionContext): WorkerTe
 	if (!owner.team || owner.sessionId !== sessionId) {
 		void owner.team?.dispose();
 		owner.sessionId = sessionId;
-		owner.team = new WorkerTeam(pi);
+		owner.team = new WorkerTeam(pi, ctx.sessionManager);
+		if (ctx.hasUI) {
+			const team = owner.team;
+			const spinnerFor = sharedWorkerSpinner();
+			ctx.ui.setWidget(
+				"subagents",
+				(tui, theme) =>
+					new SubagentWidget(
+						team,
+						tui,
+						theme,
+						(workerId) => {
+							if (workerId) showWorkerView(ctx.ui, team, workerId);
+							else ctx.ui.setMainView(undefined);
+						},
+						spinnerFor(tui, theme),
+					),
+				{ placement: "belowEditor" },
+			);
+			// A disposed team has no workers, so a section left behind by a closed session renders nothing.
+			ctx.ui.setSidePanelSection(
+				"subagents",
+				(tui, theme) => new SubagentSection(team, tui, theme, spinnerFor(tui, theme)),
+				{ order: 10 },
+			);
+		}
 	}
 	return owner.team;
 }
@@ -98,14 +158,19 @@ function getOwner(pi: ExtensionAPI, ctx: ExtensionContext): TeamOwner {
 /** Owns worker identities, retained sessions, and all queued runs for one parent session. */
 export class WorkerTeam {
 	private readonly pi: ExtensionAPI;
+	private readonly sessionManager?: ReadonlySessionManager;
+	private readonly sessionId?: string;
 	private readonly workers = new Map<string, Worker>();
+	private readonly listeners = new Set<() => void>();
 	private readonly jobs: BackgroundJobManager<WorkerRun, SingleResult>;
 	private readonly warmup = new PrefixWarmup();
 	private isDisposed = false;
 	private disposal?: Promise<void>;
 
-	constructor(pi: ExtensionAPI) {
+	constructor(pi: ExtensionAPI, sessionManager?: ReadonlySessionManager) {
 		this.pi = pi;
+		this.sessionManager = sessionManager;
+		this.sessionId = sessionManager?.getSessionId();
 		this.jobs = new BackgroundJobManager(
 			(run, signal) => this.execute(run, signal),
 			(job) => this.settle(job),
@@ -118,10 +183,15 @@ export class WorkerTeam {
 		const id = randomUUID();
 		const worker: Worker = {
 			id,
+			// Workers are never removed from the map, so its size is the spawn order.
+			color: workerColorAt(this.workers.size),
 			input,
 			status: "queued",
 			inbox: [],
+			assignments: [],
 			hasStarted: false,
+			runs: [],
+			elapsedMs: 0,
 			session: createWorkerSession(
 				input.defaults,
 				input.resolved,
@@ -131,10 +201,24 @@ export class WorkerTeam {
 					request: (request) => this.request(id, request),
 				},
 				this.warmup,
+				(usage) => this.recordWorkerUsage(id, usage),
 			),
 		};
 		this.workers.set(id, worker);
 		return { id, result: this.enqueue(worker, input.task) };
+	}
+
+	/** Queues an assignment notification for an existing worker without replacing its conversation. */
+	assign(id: string, assignment: AssignmentInput): { id: string; result: Promise<SingleResult> } {
+		this.assertActive();
+		const worker = this.getWorker(id);
+		if (worker.status === "cancelled") throw new Error(`Worker ${id} is cancelled`);
+		const input = { ...worker.input, ...assignment, step: undefined, onUpdate: undefined, makeDetails: undefined };
+		const run = this.createRun(worker, input, "assignment");
+		worker.assignments.push(run);
+		if (!worker.run) this.startAssignment(worker);
+		this.notify();
+		return { id, result: run.result };
 	}
 
 	/** Lists workers with their stable identities and pending message counts. */
@@ -145,7 +229,59 @@ export class WorkerTeam {
 			task: worker.input.task.slice(0, 500),
 			status: worker.status,
 			inboxCount: worker.inbox.length,
+			assignmentCount: worker.assignments.length,
 		}));
+	}
+
+	/** Counts the workers without building their views. */
+	count(): number {
+		return this.isDisposed ? 0 : this.workers.size;
+	}
+
+	/** Looks a worker up by ID in constant time; undefined when it is unknown or the team is disposed. */
+	getIdentity(id: string): WorkerIdentity | undefined {
+		const worker = this.isDisposed ? undefined : this.workers.get(id);
+		return worker && { id, name: worker.input.name, color: worker.color };
+	}
+
+	/** Supplies live display data without switching away from the parent session. */
+	getViews(): WorkerView[] {
+		if (this.isDisposed) return [];
+		return this.list().map((summary) => {
+			const worker = this.workers.get(summary.id)!;
+			const latest = worker.runs[worker.run?.resultIndex ?? worker.runs.length - 1];
+			return {
+				...summary,
+				color: worker.color,
+				agentType: worker.input.resolved.agent?.name ?? worker.input.name,
+				model: latest?.model ?? worker.input.defaults.model ?? worker.input.resolved.agent?.model,
+				reasoningEffort: worker.input.defaults.thinkingLevel,
+				usage: {
+					...aggregateUsage(worker.runs),
+					contextTokens: latest?.usage.contextTokens ?? 0,
+					firstCacheHitRate: latest?.usage.firstCacheHitRate,
+				},
+				elapsedMs: worker.elapsedMs + (worker.startedAt === undefined ? 0 : Date.now() - worker.startedAt),
+				runs: worker.runs,
+			};
+		});
+	}
+
+	/** Subscribes to worker state and transcript updates. */
+	subscribe(listener: () => void): () => void {
+		this.listeners.add(listener);
+		return () => this.listeners.delete(listener);
+	}
+
+	private notify(): void {
+		for (const listener of this.listeners) listener();
+	}
+
+	private recordWorkerUsage(workerId: string, usage: UsageTotals): void {
+		if (this.isDisposed || (this.sessionManager && this.sessionManager.getSessionId() !== this.sessionId)) return;
+		const snapshot: SubagentUsageSnapshot = { workerId, usage };
+		this.pi.appendEntry(SUBAGENT_USAGE_ENTRY, snapshot);
+		this.notify();
 	}
 
 	/** Permanently cancels a worker and releases its retained session. */
@@ -161,6 +297,7 @@ export class WorkerTeam {
 		}
 		worker.status = "cancelled";
 		worker.inbox.length = 0;
+		this.notify();
 		worker.cancellation = this.cancelWorker(worker);
 		await worker.cancellation;
 		return "cancelled";
@@ -171,6 +308,7 @@ export class WorkerTeam {
 		const worker = this.getWorker(id);
 		if (worker.status === "cancelled") return "cancelled";
 		worker.status = "interrupted";
+		this.notify();
 		const run = worker.run;
 		if (run?.queueId) {
 			await this.jobs.cancel(run.queueId);
@@ -213,17 +351,18 @@ export class WorkerTeam {
 					display: true,
 					details: { sender: from },
 				},
-				{ deliverAs: "followUp", triggerTurn: true },
+				{ deliverAs: "steer", triggerTurn: true },
 			);
-			return "delivered";
+			return "queued";
 		}
 		const worker = this.getWorker(to);
 		if (worker.status === "cancelled") return "cancelled";
 		const content = `Message from ${sender}:\n${message}`;
-		if (worker.status === "running" && (await worker.session.send(content, "followUp"))) return "delivered";
+		if (worker.status === "running" && (await worker.session.send(content, "steer"))) return "delivered";
 		this.assertActive();
 		if (this.getWorker(to).status === "cancelled") return "cancelled";
 		worker.inbox.push(content);
+		this.notify();
 		if (worker.status === "interrupted") return "queued_until_continue";
 		if (worker.run) return "queued";
 		try {
@@ -239,6 +378,8 @@ export class WorkerTeam {
 	dispose(): Promise<void> {
 		if (this.disposal) return this.disposal;
 		this.isDisposed = true;
+		this.notify();
+		this.listeners.clear();
 		this.warmup.dispose();
 		for (const worker of this.workers.values()) {
 			worker.status = "cancelled";
@@ -253,6 +394,24 @@ export class WorkerTeam {
 	}
 
 	private async cancelWorker(worker: Worker): Promise<void> {
+		const queued = worker.assignments.splice(0);
+		for (const assignment of queued) {
+			const result = this.emptyResult(
+				worker,
+				assignment.task,
+				"aborted",
+				"Worker cancelled before assignment started",
+			);
+			worker.runs[assignment.resultIndex] = result;
+			this.notify();
+			try {
+				await assignment.input.onResult?.(result, worker.id);
+			} catch {
+				/* Result delivery cannot prevent cancellation of the remaining assignments. */
+			} finally {
+				assignment.resolve(result);
+			}
+		}
 		const run = worker.run;
 		if (run?.queueId) {
 			await this.jobs.cancel(run.queueId);
@@ -264,6 +423,8 @@ export class WorkerTeam {
 	private async disposeWorkers(): Promise<void> {
 		await this.jobs.shutdown();
 		for (const worker of this.workers.values()) {
+			for (const assignment of worker.assignments.splice(0))
+				assignment.resolve(this.emptyResult(worker, assignment.task, "aborted", "Parent session changed"));
 			if (worker.run)
 				worker.run.resolve(this.emptyResult(worker, worker.run.task, "aborted", "Parent session changed"));
 		}
@@ -271,25 +432,56 @@ export class WorkerTeam {
 	}
 
 	private enqueue(worker: Worker, task: string): Promise<SingleResult> {
+		const run = this.createRun(worker, { ...worker.input, task }, worker.hasStarted ? "continuation" : "assignment");
+		worker.status = "queued";
+		worker.run = run;
+		run.queueId = this.jobs.enqueue(run);
+		this.notify();
+		return run.result;
+	}
+
+	private createRun(worker: Worker, input: SpawnInput, kind: WorkerRun["kind"]): WorkerRun {
 		let resolveResult!: (result: SingleResult) => void;
 		const result = new Promise<SingleResult>((resolve) => {
 			resolveResult = resolve;
 		});
-		const run: WorkerRun = { worker, task, result, resolve: resolveResult, isInitial: !worker.hasStarted };
+		const run: WorkerRun = {
+			worker,
+			input,
+			kind,
+			task: input.task,
+			result,
+			resolve: resolveResult,
+			isInitial: !worker.hasStarted,
+			resultIndex: worker.runs.length,
+		};
+		worker.runs.push(this.emptyResult(worker, input.task, "pending", ""));
 		worker.hasStarted = true;
+		return run;
+	}
+
+	private startAssignment(worker: Worker): void {
+		const run = worker.assignments.shift();
+		if (!run) return;
+		worker.input = run.input;
 		worker.status = "queued";
 		worker.run = run;
 		run.queueId = this.jobs.enqueue(run);
-		return result;
+		this.notify();
 	}
 
 	private async execute(run: WorkerRun, signal: AbortSignal): Promise<SingleResult> {
 		const { worker } = run;
 		worker.status = "running";
+		worker.startedAt = Date.now();
+		this.notify();
+		const assignment = run.input.beforeStart?.();
+		if (assignment !== undefined)
+			run.task = run.kind === "assignment" ? assignment : `${assignment}\n\nFollow up instruction:\n${run.task}`;
 		const pending = worker.inbox.splice(0);
 		const task = pending.length ? `${run.task}\n\n${pending.join("\n\n")}` : run.task;
 		const details: (results: SingleResult[]) => SubagentDetails =
-			(run.isInitial ? worker.input.makeDetails : undefined) ??
+			(run.isInitial ? run.input.makeDetails : undefined) ??
 			((results) => ({
 				mode: "single",
 				results,
@@ -298,9 +490,14 @@ export class WorkerTeam {
 			}));
 		return worker.session.run(
 			task,
-			worker.input.step,
+			run.input.step,
 			signal,
-			run.isInitial ? worker.input.onUpdate : undefined,
+			(partial) => {
+				const result = partial.details?.results[0];
+				if (result) worker.runs[run.resultIndex] = result;
+				this.notify();
+				if (run.isInitial) run.input.onUpdate?.(partial);
+			},
 			details,
 		);
 	}
@@ -318,21 +515,36 @@ export class WorkerTeam {
 				job.state.status === "failed" ? job.state.error : "Worker run interrupted",
 			);
 		settled.workerId = worker.id;
+		worker.runs[job.input.resultIndex] = settled;
+		if (worker.startedAt !== undefined) {
+			worker.elapsedMs += Date.now() - worker.startedAt;
+			worker.startedAt = undefined;
+		}
 		if (worker.status !== "cancelled" && worker.status !== "interrupted") {
 			worker.status =
 				settled.status === "aborted" ? "interrupted" : settled.status === "failed" ? "failed" : "completed";
 		}
+		this.notify();
 		if (this.isDisposed) {
 			job.input.resolve(settled);
 			return;
 		}
 		try {
-			await worker.input.onResult?.(settled, worker.id);
+			await job.input.input.onResult?.(settled, worker.id);
 		} catch {
 			/* Result delivery cannot stall the shared queue. */
 		}
 		worker.run = undefined;
 		job.input.resolve(settled);
+		if (
+			!this.isDisposed &&
+			worker.status !== "cancelled" &&
+			worker.status !== "interrupted" &&
+			worker.assignments.length
+		) {
+			this.startAssignment(worker);
+			return;
+		}
 		if (
 			this.isDisposed ||
 			worker.run ||
@@ -367,7 +579,12 @@ export class WorkerTeam {
 		if (this.isDisposed) throw new Error("Worker team belongs to a closed parent session");
 	}
 
-	private emptyResult(worker: Worker, task: string, status: "aborted" | "failed", errorMessage: string): SingleResult {
+	private emptyResult(
+		worker: Worker,
+		task: string,
+		status: SingleResult["status"],
+		errorMessage: string,
+	): SingleResult {
 		return {
 			agent: worker.input.name,
 			agentSource: worker.input.resolved.agent?.source ?? "unknown",

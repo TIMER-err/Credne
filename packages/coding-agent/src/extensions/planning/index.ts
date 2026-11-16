@@ -1,40 +1,48 @@
 // Coordinates persisted plans and background workers with automatic task completion.
 import { Type } from "typebox";
 import { Value } from "typebox/value";
-import type { ExtensionAPI, ExtensionContext } from "../../core/extensions/types.ts";
+import type { ExtensionAPI, ExtensionContext, ExtensionUIContext } from "../../core/extensions/types.ts";
+import { MAIN_AGENT_PROMPT } from "../../core/main-agent-prompt.ts";
 import { truncateHead } from "../../core/tools/truncate.ts";
 import { type AgentConfig, discoverBundledAgents } from "../subagent/agents.ts";
 import { captureSubagentContext, listSubagentContext, turnSchema } from "../subagent/context.ts";
 import { createSubagentDispatch, reasoningEffortSchema } from "../subagent/dispatch.ts";
 import { type DispatchDefaults, getFinalOutput, type SingleResult } from "../subagent/runner.ts";
-import { getWorkerTeam, type WorkerTeam } from "../subagent/team.ts";
+import { type AssignmentInput, getWorkerTeam, type WorkerTeam } from "../subagent/team.ts";
 import {
 	completeTask,
 	createPlan,
 	failTask,
 	type Plan,
+	queueTasks,
 	reopenTask,
-	reviewTask,
 	revisePlan,
 	selectReadyTasks,
+	startQueuedTask,
 	startTasks,
 	type TaskSpec,
+	updateTask,
+	validatePersistedPlan,
 } from "./graph.ts";
-import { planSchema, taskSpecSchema } from "./schema.ts";
+import { PLANNING_GUIDANCE } from "./guidance.ts";
+import { planSchema, taskCreateSchema, taskRevisionSchema, taskUpdateSchema } from "./schema.ts";
+import { PlanningSection, PlanningWidget, sharedTaskSpinner } from "./widget.ts";
 
 const toolNames = [
+	"enter_plan_mode",
 	"create_plan",
+	"task_create",
+	"task_update",
 	"revise_plan",
 	"get_plan",
 	"assign_tasks",
-	"review_task",
+	"assign_task",
 	"cancel_tasks",
 	"get_subagent_context",
 	"checkpoint_context",
 ];
-const revisionSchema = Type.Integer({ minimum: 1 });
+const revisionSchema = Type.Integer({ minimum: 1, description: "Current plan revision returned by get_plan." });
 const taskIdsSchema = Type.Array(Type.String(), { minItems: 1, maxItems: 4, uniqueItems: true });
-const planningGuidance = `For nontrivial implementation work, create a plan before implementation. Start from the objective, constraints, and explicit assumptions. Divide by modular components with contracts, owned paths, dependencies, order, and acceptance criteria. Creating or revising a plan never starts workers. Mark meaningful stages you complete yourself, such as documentation reviewed or design agreed, with checkpoint_context so later workers can inherit that context boundary. Task results and optional review decisions become checkpoints automatically. Before assigning work, assess which ready tasks can run together. Use the same order for tasks that may run concurrently, dependencies for required outputs, and a phase containing only one task for exclusive execution. Ownership must be disjoint. Assign selected task IDs through assign_tasks, continue coordinating while they run, and revise the full active plan when evidence changes the design. Do not edit paths owned by running workers yourself. Successful workers complete tasks directly and release satisfied dependencies. Groups complete automatically after their children and prerequisites complete. Use review_task only when an optional review is useful, to record evidence or reopen completed work if a problem is found. This is an execution workflow and does not require a separate user approval or read only mode.`;
 
 interface WorkerJob {
 	id: string;
@@ -49,6 +57,7 @@ export default function planningExtension(pi: ExtensionAPI): void {
 	let generation = 0;
 	let isTransitioning = false;
 	const jobs = new Map<string, WorkerJob>();
+	const workerPlans = new Map<string, string>();
 	const isWorker = () => pi.getFlag("planning-worker") === true;
 
 	pi.registerFlag("planning-worker", {
@@ -90,10 +99,27 @@ export default function planningExtension(pi: ExtensionAPI): void {
 	function save(next: Plan, ctx: ExtensionContext): void {
 		plan = next;
 		pi.appendEntry("planning-state", next);
-		if (ctx.hasUI)
-			ctx.ui.setWidget("planning", [
-				`Tasks: ${next.tasks.filter((task) => task.state.status === "done").length} completed, ${next.tasks.filter((task) => task.state.status === "running").length} running, revision ${next.revision}`,
-			]);
+		if (ctx.hasUI) showPlan(next, ctx.ui);
+	}
+
+	// The widget above the input box and the side panel section show the same plan; the widget
+	// renders nothing while the panel is open.
+	function showPlan(next: Plan, ui: ExtensionUIContext): void {
+		const spinnerFor = sharedTaskSpinner(next);
+		const workerOf = (taskId: string) => {
+			const job = jobs.get(taskId);
+			return job?.team.getIdentity(job.id);
+		};
+		ui.setWidget(
+			"planning",
+			(tui, theme) => new PlanningWidget(next, tui, theme, spinnerFor(tui, theme), () => ui.isSidePanelOpen()),
+			{ placement: "aboveEditor" },
+		);
+		ui.setSidePanelSection(
+			"planning",
+			(tui, theme) => new PlanningSection(next, theme, spinnerFor(tui, theme), workerOf),
+			{ order: 0 },
+		);
 	}
 
 	async function drainWorkers(): Promise<void> {
@@ -101,6 +127,7 @@ export default function planningExtension(pi: ExtensionAPI): void {
 		const stopping = [...jobs.values()];
 		await Promise.all(stopping.map((job) => job.team.cancel(job.id)));
 		jobs.clear();
+		workerPlans.clear();
 	}
 
 	async function stopWorkers(_event: unknown, ctx: ExtensionContext): Promise<void> {
@@ -110,7 +137,7 @@ export default function planningExtension(pi: ExtensionAPI): void {
 			if (!plan) return;
 			let stopped = plan;
 			for (const task of stopped.tasks) {
-				if (task.state.status === "running")
+				if (task.state.status === "running" || task.state.status === "queued")
 					stopped = failTask(
 						stopped,
 						task.spec.id,
@@ -132,7 +159,10 @@ export default function planningExtension(pi: ExtensionAPI): void {
 		} finally {
 			isTransitioning = false;
 		}
-		if (ctx.hasUI) ctx.ui.setWidget("planning", undefined);
+		if (ctx.hasUI) {
+			ctx.ui.setWidget("planning", undefined);
+			ctx.ui.setSidePanelSection("planning", undefined);
+		}
 		// A worker has no plan of its own; its tool allowlist leaves the planning tools undeclared.
 		if (isWorker()) return;
 		const entry = ctx.sessionManager
@@ -145,15 +175,11 @@ export default function planningExtension(pi: ExtensionAPI): void {
 			return;
 		}
 		let restored: Plan = entry.data;
-		// Validate graph invariants as well as the serialized shape before trusting disk state.
+		// Validate task invariants as well as the serialized shape before trusting disk state.
 		try {
-			createPlan(
-				restored.objective,
-				restored.tasks.filter((task) => task.state.status !== "superseded").map((task) => task.spec),
-				restored.reason,
-			);
+			validatePersistedPlan(restored);
 			for (const task of restored.tasks) {
-				if (task.state.status === "running")
+				if (task.state.status === "running" || task.state.status === "queued")
 					restored = failTask(
 						restored,
 						task.spec.id,
@@ -162,32 +188,50 @@ export default function planningExtension(pi: ExtensionAPI): void {
 			}
 			save(restored, ctx);
 		} catch (error) {
-			if (ctx.hasUI) ctx.ui.notify(`Ignored invalid planning graph: ${String(error)}`, "warning");
+			if (ctx.hasUI) ctx.ui.notify(`Ignored invalid planning state: ${String(error)}`, "warning");
 		}
 	}
 
 	function launch(
 		spec: TaskSpec,
-		agent: AgentConfig,
-		defaults: DispatchDefaults,
+		target: { kind: "new"; agent: AgentConfig; defaults: DispatchDefaults } | { kind: "existing"; workerId: string },
 		execution: "background" | "foreground",
 		ctx: ExtensionContext,
 	): WorkerJob {
-		const assignedPlan = requirePlan();
 		const workerGeneration = generation;
 		let hasReturned = false;
 		const team = getWorkerTeam(pi, ctx);
-		const worker = team.spawn({
-			name: spec.id,
-			task: renderAssignment(assignedPlan, spec),
-			defaults,
-			resolved: { agent, available: [agent], cwd: ctx.cwd },
+		let workerId: string;
+		const assignment: AssignmentInput = {
+			task: spec.name,
+			beforeStart() {
+				const current = requirePlan();
+				const task = current.tasks.find((task) => task.spec.id === spec.id);
+				if (
+					workerGeneration !== generation ||
+					jobs.get(spec.id)?.id !== workerId ||
+					!task ||
+					JSON.stringify(task.spec) !== JSON.stringify(spec)
+				)
+					throw new Error("This worker assignment is no longer current");
+				if (task.state.status === "queued") save(startQueuedTask(current, spec.id), ctx);
+				else if (task.state.status !== "running") throw new Error(`Task ${spec.id} is not assigned`);
+				const active = requirePlan();
+				const definition = {
+					objective: active.objective,
+					tasks: active.tasks.filter((task) => task.state.status !== "superseded").map((task) => task.spec),
+				};
+				const fingerprint = JSON.stringify(definition);
+				const context = workerPlans.get(workerId) === fingerprint ? undefined : definition;
+				workerPlans.set(workerId, fingerprint);
+				return renderAssignment(active, spec, context);
+			},
 			beforeResume() {
 				const current = requirePlan();
 				const task = current.tasks.find((task) => task.spec.id === spec.id);
 				if (
 					workerGeneration !== generation ||
-					jobs.get(spec.id)?.id !== worker.id ||
+					jobs.get(spec.id)?.id !== workerId ||
 					!task ||
 					JSON.stringify(task.spec) !== JSON.stringify(spec) ||
 					task.state.status === "superseded"
@@ -199,9 +243,11 @@ export default function planningExtension(pi: ExtensionAPI): void {
 						: current;
 				save(startTasks(reopened, [spec.id]), ctx);
 			},
-			onResult(result, workerId) {
-				if (workerGeneration !== generation || !plan || jobs.get(spec.id)?.id !== workerId) return;
-				if (plan.tasks.find((task) => task.spec.id === spec.id)?.state.status !== "running") return;
+			onResult(result, resultWorkerId) {
+				if (workerGeneration !== generation || !plan || jobs.get(spec.id)?.id !== resultWorkerId) return;
+				const status = plan.tasks.find((task) => task.spec.id === spec.id)?.state.status;
+				if (status !== "running" && status !== "queued") return;
+				if (result.status !== "completed") workerPlans.delete(resultWorkerId);
 				const output =
 					getFinalOutput(result.messages) || result.errorMessage || result.stderr || "Worker returned no output";
 				const triggerTurn = execution === "background" || hasReturned;
@@ -214,26 +260,66 @@ export default function planningExtension(pi: ExtensionAPI): void {
 					{
 						customType: "planning-result",
 						content: `${bounded(
-							`Task ${spec.id}, worker ${workerId}: ${result.status}.\n${output}`,
+							`Task ${spec.id}, worker ${resultWorkerId}: ${result.status}.\n${output}`,
 						)}\nUsage: ${JSON.stringify(result.usage)}`,
 						display: true,
-						details: { taskId: spec.id, workerId, result },
+						details: { taskId: spec.id, workerId: resultWorkerId, result },
 					},
 					{ triggerTurn, deliverAs: "followUp" },
 				);
 			},
-		});
+		};
+		const worker =
+			target.kind === "existing"
+				? team.assign(target.workerId, assignment)
+				: team.spawn({
+						...assignment,
+						name: spec.id,
+						defaults: target.defaults,
+						resolved: { agent: target.agent, available: [target.agent], cwd: ctx.cwd },
+					});
+		workerId = worker.id;
 		const job = { id: worker.id, team, result: worker.result };
 		jobs.set(spec.id, job);
 		return job;
 	}
 
 	pi.registerTool({
+		name: "enter_plan_mode",
+		label: "Enter planning",
+		description: "Use this tool proactively when you're about to start a non-trivial implementation task.",
+		parameters: Type.Object({}),
+		executionMode: "sequential",
+		async execute(_id, _args, _signal, _update, ctx) {
+			requireMain();
+			const result = snapshot();
+			const examplesShown = ctx.sessionManager
+				.getBranch()
+				.some(
+					(entry) =>
+						(entry.type === "custom" && entry.customType === "planning-examples-shown") ||
+						(entry.type === "message" &&
+							entry.message.role === "toolResult" &&
+							entry.message.toolName === "enter_plan_mode" &&
+							!entry.message.isError),
+				);
+			if (examplesShown) return result;
+			// Persist before returning so another call in this batch cannot insert the examples again.
+			pi.appendEntry("planning-examples-shown");
+			return { ...result, content: [{ type: "text", text: PLANNING_GUIDANCE }, ...result.content] };
+		},
+	});
+
+	pi.registerTool({
 		name: "create_plan",
 		label: "Create plan",
-		description:
-			"Record a modular implementation plan without starting workers. Assign ready task IDs separately; same order tasks may run concurrently when dependencies and ownership permit.",
-		parameters: Type.Object({ objective: Type.String(), tasks: Type.Array(taskSpecSchema, { minItems: 1 }) }),
+		description: "Create a structured task list. The harness generates and returns task IDs.",
+		parameters: Type.Object({
+			objective: Type.String({ description: "Overall outcome the plan should achieve." }),
+			tasks: Type.Array(taskCreateSchema, {
+				description: "Tasks needed to achieve the objective; IDs are generated.",
+			}),
+		}),
 		executionMode: "sequential",
 		async execute(_id, args, _signal, _update, ctx) {
 			requireMain();
@@ -246,13 +332,58 @@ export default function planningExtension(pi: ExtensionAPI): void {
 		},
 	});
 	pi.registerTool({
+		name: "task_create",
+		label: "Create task",
+		description: "Add a task to the plan. The harness generates and returns its ID.",
+		parameters: Type.Object(
+			{ revision: revisionSchema, ...taskCreateSchema.properties },
+			{ additionalProperties: false },
+		),
+		executionMode: "sequential",
+		async execute(_id, args, _signal, _update, ctx) {
+			const { revision, ...spec } = args;
+			const current = requirePlan(revision);
+			save(
+				revisePlan(
+					current,
+					[...current.tasks.filter((task) => task.state.status !== "superseded").map((task) => task.spec), spec],
+					"Added task",
+				),
+				ctx,
+			);
+			return snapshot();
+		},
+	});
+	pi.registerTool({
+		name: "task_update",
+		label: "Update task",
+		description:
+			"Use this tool to update a task in the task list.\n\n- ONLY mark a task as completed when you have FULLY accomplished it\n\nMake sure to read a task's latest state using `get_plan` before updating it.",
+		parameters: taskUpdateSchema,
+		executionMode: "sequential",
+		async execute(_id, args, _signal, _update, ctx) {
+			const { revision, taskId, ...patch } = args;
+			const current = requirePlan(revision);
+			const status = current.tasks.find((task) => task.spec.id === taskId)?.state.status;
+			if (jobs.has(taskId) && (status === "running" || status === "queued"))
+				throw new Error("Wait for the assigned worker to settle or cancel it before updating this task");
+			save(updateTask(current, taskId, patch), ctx);
+			jobs.delete(taskId);
+			return snapshot(taskId);
+		},
+	});
+	pi.registerTool({
 		name: "revise_plan",
 		label: "Revise plan",
-		description: "Replace the full active task specification based on evidence; preserve unaffected running tasks.",
+		description:
+			"Replace the active task list. Use returned IDs to retain existing tasks; omit IDs for new tasks generated by the harness.",
 		parameters: Type.Object({
 			revision: revisionSchema,
-			reason: Type.String({ minLength: 1 }),
-			tasks: Type.Array(taskSpecSchema, { minItems: 1 }),
+			reason: Type.String({ minLength: 1, description: "Why the plan is changing." }),
+			tasks: Type.Array(taskRevisionSchema, {
+				description:
+					"Complete replacement task list. Use existing returned IDs to retain tasks; omit IDs for new tasks.",
+			}),
 		}),
 		executionMode: "sequential",
 		async execute(_id, args, _signal, _update, ctx) {
@@ -263,9 +394,10 @@ export default function planningExtension(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "get_plan",
 		label: "Get plan",
-		description:
-			"Inspect current task states, revision, outputs, and ready task IDs. Select taskId to inspect a specific result.",
-		parameters: Type.Object({ taskId: Type.Optional(Type.String()) }),
+		description: "Use this tool to list all tasks in the task list.",
+		parameters: Type.Object({
+			taskId: Type.Optional(Type.String({ description: "Task ID to inspect; omit to return the whole plan." })),
+		}),
 		async execute(_id, args) {
 			requireMain();
 			return snapshot(args.taskId);
@@ -274,8 +406,7 @@ export default function planningExtension(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "checkpoint_context",
 		label: "Mark context milestone",
-		description:
-			"Mark a meaningful stage you completed yourself, such as documentation reviewed or design agreed. Its context becomes selectable through get_subagent_context after this tool batch completes. This records a context boundary and does not complete a planning task.",
+		description: "Record a named context checkpoint without changing task status.",
 		parameters: Type.Object({
 			name: Type.String({ minLength: 1, maxLength: 120 }),
 			description: Type.Optional(Type.String({ maxLength: 2000 })),
@@ -295,8 +426,7 @@ export default function planningExtension(pi: ExtensionAPI): void {
 	pi.registerTool({
 		name: "get_subagent_context",
 		label: "Get subagent context",
-		description:
-			"List numbered context checkpoints on the current branch, including completed stages, worker results, and task reviews. Use turn: 0 for fresh context, -1 for latest safe history, or a listed checkpoint number as the cutoff.",
+		description: "List context checkpoints for the subagent turn parameter.",
 		parameters: Type.Object({}),
 		async execute(_id, _args, _signal, _update, ctx) {
 			requireMain();
@@ -308,7 +438,7 @@ export default function planningExtension(pi: ExtensionAPI): void {
 		name: "assign_tasks",
 		label: "Assign tasks",
 		description:
-			"Assign 1 to 4 ready task IDs at the current revision. background defaults to true and returns worker IDs immediately; background: false waits for every first run result and returns outputs, status, and usage. Creation and revision never spawn workers. Model, reasoningEffort, and turn apply to this batch. turn: 0 starts fresh, -1 copies latest safe history, and a positive number copies through that checkpoint from get_subagent_context. Use separate calls for different controls. Coordinate returned IDs with send_agent_message, interrupt_agent, continue_agent, and steer_agent.",
+			"Assign ready tasks to new workers. Returns worker IDs; successful results complete tasks automatically. Model, reasoningEffort, and turn apply to the batch.",
 		parameters: Type.Object({
 			revision: revisionSchema,
 			taskIds: taskIdsSchema,
@@ -344,14 +474,17 @@ export default function planningExtension(pi: ExtensionAPI): void {
 			);
 			const context = captureSubagentContext(args.turn, ctx);
 			const background = args.background ?? true;
-			const next = startTasks(current, args.taskIds);
+			const next = queueTasks(current, args.taskIds);
 			save(next, ctx);
 			const dispatched = args.taskIds.map((id) => ({
 				taskId: id,
 				job: launch(
 					next.tasks.find((task) => task.spec.id === id)!.spec,
-					agent,
-					{ ...resolved, context, extraArgs: ["--planning-worker", "--subagent-worker"] },
+					{
+						kind: "new",
+						agent,
+						defaults: { ...resolved, context, extraArgs: ["--planning-worker", "--subagent-worker"] },
+					},
 					background ? "background" : "foreground",
 					ctx,
 				),
@@ -379,34 +512,64 @@ export default function planningExtension(pi: ExtensionAPI): void {
 		},
 	});
 	pi.registerTool({
-		name: "review_task",
-		label: "Review task",
+		name: "assign_task",
+		label: "Assign task to worker",
 		description:
-			"Optionally review completed work. Accept records verification evidence; reject reopens affected work unless it would invalidate running tasks. Successful workers and groups complete without this operation.",
+			"Queue a ready task for an existing worker. Appends task details and the plan when new or changed after its current run finishes.",
 		parameters: Type.Object({
 			revision: revisionSchema,
 			taskId: Type.String(),
-			verdict: Type.Union([Type.Literal("accept"), Type.Literal("reject")]),
-			evidence: Type.String({ minLength: 1 }),
+			workerId: Type.String(),
+			background: Type.Optional(
+				Type.Boolean({
+					default: true,
+					description: "Return immediately when true; wait for the result when false.",
+				}),
+			),
 		}),
 		executionMode: "sequential",
-		async execute(_id, args, _signal, _update, ctx) {
-			save(reviewTask(requirePlan(args.revision), args.taskId, args.verdict, args.evidence), ctx);
-			return snapshot();
+		async execute(_id, args, signal, _update, ctx) {
+			const current = requirePlan(args.revision);
+			if (signal?.aborted) throw new Error("Task assignment aborted before starting");
+			const team = getWorkerTeam(pi, ctx);
+			const worker = team.list().find((worker) => worker.id === args.workerId);
+			if (!worker || worker.status === "cancelled") throw new Error("Choose an available worker from list_agents");
+			const next = queueTasks(current, [args.taskId]);
+			save(next, ctx);
+			const background = args.background ?? true;
+			const job = launch(
+				next.tasks.find((task) => task.spec.id === args.taskId)!.spec,
+				{ kind: "existing", workerId: args.workerId },
+				background ? "background" : "foreground",
+				ctx,
+			);
+			const completed = background ? undefined : (await waitForWorkers([job], signal))[0];
+			const result = snapshot();
+			const assignment = {
+				taskId: args.taskId,
+				workerId: job.id,
+				background,
+				status: completed?.status ?? "queued",
+				output: completed ? getFinalOutput(completed.messages) : undefined,
+			};
+			return {
+				content: [...result.content, { type: "text", text: JSON.stringify(assignment) }],
+				details: { ...result.details, assignment },
+			};
 		},
 	});
 	pi.registerTool({
 		name: "cancel_tasks",
 		label: "Cancel tasks",
-		description: "Abort selected workers and wait until they stop before making their tasks retryable.",
+		description: "Stop the selected tasks' workers and their queued assignments; wait until they exit.",
 		parameters: Type.Object({ revision: revisionSchema, taskIds: taskIdsSchema }),
 		executionMode: "sequential",
 		async execute(_id, args) {
 			requirePlan(args.revision);
 			const selected = args.taskIds.map((id) => {
 				const job = jobs.get(id);
-				if (!job || plan?.tasks.find((task) => task.spec.id === id)?.state.status !== "running")
-					throw new Error(`No running worker for ${id}`);
+				const status = plan?.tasks.find((task) => task.spec.id === id)?.state.status;
+				if (!job || (status !== "running" && status !== "queued")) throw new Error(`No assigned worker for ${id}`);
 				return job;
 			});
 			await Promise.all(selected.map((job) => job.team.cancel(job.id)));
@@ -418,16 +581,16 @@ export default function planningExtension(pi: ExtensionAPI): void {
 			return { block: true, reason: "Planning workers cannot invoke planning tools" };
 	});
 	pi.on("before_agent_start", async (event) => {
-		if (!pi.getActiveTools().includes("create_plan")) return;
+		if (!pi.getActiveTools().includes("enter_plan_mode")) return;
 		// A named section rather than a replaced prompt: a replaced prompt is rebuilt at the head of
 		// every request, so later prompt and tool changes could not be appended and would discard
-		// the provider's prompt cache. Workers never get here: their tools leave create_plan out.
-		event.systemPromptOptions.sections.planning = planningGuidance;
+		// the provider's prompt cache. Workers leave enter_plan_mode out of their tools.
+		event.systemPromptOptions.sections.planning = MAIN_AGENT_PROMPT.planning;
 		if (!plan) return;
 		const current = `Current plan revision ${plan.revision}: ${plan.objective}. ${plan.tasks
 			.filter((task) => task.state.status !== "superseded")
 			.map((task) => `${task.spec.id}: ${task.state.status}`)
-			.join(", ")}. Use get_plan to inspect details before mutating.`;
+			.join(", ")}.`;
 		return { message: { customType: "planning-context", content: current, display: false } };
 	});
 	pi.on("session_start", async (_event, ctx) => restore(ctx));
@@ -454,31 +617,19 @@ async function waitForWorkers(jobs: WorkerJob[], signal: AbortSignal | undefined
 	}
 }
 
-/**
- * The first message of a plan worker: the planning rules it follows, then the objective, its task,
- * the groups the task belongs to (nearest first) and the results of the tasks it depends on. The
- * worker's system prompt is the `worker` agent prompt, like any worker's.
- */
-function renderAssignment(plan: Plan, spec: TaskSpec): string {
-	// The plan graph was validated on creation: parents and dependencies exist and form no cycle.
-	const byId = new Map(plan.tasks.map((task) => [task.spec.id, task]));
-	const ancestors: { id: string; name: string; description: string }[] = [];
-	for (let parentId = spec.parentId; parentId !== undefined; ) {
-		const parent = byId.get(parentId)!.spec;
-		ancestors.push({ id: parent.id, name: parent.name, description: parent.description });
-		parentId = parent.parentId;
-	}
-	const dependencies = spec.dependsOn.map((id) => {
-		const { spec: dependency, state } = byId.get(id)!;
-		return {
-			id,
-			name: dependency.name,
-			...(state.status === "done" ? { output: state.output } : { status: state.status }),
-		};
-	});
-	const { dependsOn: _dependsOn, parentId: _parentId, ...task } = spec;
-	return `Planned task. Own only the task's paths and meet its acceptance criteria. Do not commit.\n${JSON.stringify(
-		{ objective: plan.objective, task, ancestors, dependencies },
+/** Supplies the assignment and only includes the full plan when it is new to the worker. */
+function renderAssignment(
+	plan: Plan,
+	spec: TaskSpec,
+	definition: { objective: string; tasks: TaskSpec[] } | undefined,
+): string {
+	const earlierResults = plan.tasks.flatMap((task) =>
+		task.spec.order < spec.order && task.state.status === "done"
+			? [{ id: task.spec.id, name: task.spec.name, output: task.state.output }]
+			: [],
+	);
+	return `Task assignment notification.\n${JSON.stringify(
+		{ plan: definition, objective: plan.objective, task: spec, earlierResults },
 		null,
 		2,
 	)}`;

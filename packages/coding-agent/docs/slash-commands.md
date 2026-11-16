@@ -11,10 +11,13 @@ Extensions, prompt templates, and skills can add commands. The command menu in P
 | `/settings` | Open settings |
 | `/model [provider/model]` | Select a model |
 | `/thinking [level]` | Set the thinking level |
+| `/effort [level]` | Set the reasoning effort level |
 | `/scoped-models` | Configure the models used by interactive cycling |
 | `/login [provider]` | Add provider authentication |
 | `/logout` | Remove provider authentication |
 | `/llama` | Manage models on the configured llama.cpp router |
+| `/accounts [subcommand]` | Browse accounts and pools, view live quotas and session estimates, or run status/list/switch/default/add/remove/enable/disable/reset ([Multiple Accounts](accounts.md)) |
+| `/models [account]` | Choose a model on a broker account or pool |
 
 ## Sessions and context
 

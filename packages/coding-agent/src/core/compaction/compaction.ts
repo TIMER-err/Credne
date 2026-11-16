@@ -24,7 +24,7 @@ import type {
 	Usage,
 } from "@earendil-works/pi-ai/compat";
 import { completeSimple } from "@earendil-works/pi-ai/compat";
-import { convertToLlm } from "../messages.ts";
+import { convertToLlm, createFailureFilter, filterFailedMessages } from "../messages.ts";
 import {
 	buildSessionProjection,
 	type CompactionEntry,
@@ -194,6 +194,7 @@ function getLastAssistantUsageInfo(messages: AgentMessage[]): { usage: Usage; in
  * If there are messages after the last usage, estimate their tokens with estimateTokens.
  */
 export function estimateContextTokens(messages: AgentMessage[]): ContextUsageEstimate {
+	messages = filterFailedMessages(messages);
 	const usageInfo = getLastAssistantUsageInfo(messages);
 
 	if (!usageInfo) {
@@ -228,6 +229,7 @@ export function estimateProjectedContextTokens(
 	projection: SessionProjection,
 	branchEntries: SessionEntry[],
 ): ContextUsageEstimate {
+	projection = filterProjectionFailures(projection);
 	const estimate = estimateContextTokens(projection.messages);
 	if (estimate.lastUsageIndex !== null) {
 		let projectedMessageIndex = 0;
@@ -856,6 +858,15 @@ function findProjectedCutPoint(
 	};
 }
 
+function filterProjectionFailures(projection: SessionProjection): SessionProjection {
+	const filterMessage = createFailureFilter(projection.messages);
+	const entries = projection.entries.map((entry) => ({
+		...entry,
+		messages: entry.messages.flatMap(filterMessage),
+	}));
+	return { ...projection, entries, messages: entries.flatMap((entry) => entry.messages) };
+}
+
 export function prepareCompaction(
 	pathEntries: SessionEntry[],
 	settings: CompactionSettings,
@@ -864,7 +875,7 @@ export function prepareCompaction(
 		return undefined;
 	}
 
-	const projection = buildSessionProjection(pathEntries);
+	const projection = filterProjectionFailures(buildSessionProjection(pathEntries));
 	const projectedEntries = projection.entries;
 	const sourceEntries = projectedEntries.map((entry) => entry.sourceEntry);
 	// The newest compaction is projected first. Older compaction entries can still

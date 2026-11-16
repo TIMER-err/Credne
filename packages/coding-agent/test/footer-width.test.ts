@@ -1,7 +1,9 @@
+import { sep } from "node:path";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { beforeAll, describe, expect, it } from "vitest";
 import type { AgentSession } from "../src/core/agent-session.ts";
 import type { ReadonlyFooterDataProvider } from "../src/core/footer-data-provider.ts";
+import type { UsageTotals } from "../src/core/usage-totals.ts";
 import { FooterComponent, formatCwdForFooter } from "../src/modes/interactive/components/footer.ts";
 import { initTheme } from "../src/modes/interactive/theme/theme.ts";
 import { stripAnsi } from "../src/utils/ansi.ts";
@@ -21,6 +23,9 @@ function createSession(options: {
 	reasoning?: boolean;
 	thinkingLevel?: string;
 	usage?: AssistantUsage;
+	additionalUsage?: AssistantUsage[];
+	snapshots?: Array<{ workerId: string; usage: UsageTotals }>;
+	usageEntry?: AssistantUsage;
 	branchUsage?: AssistantUsage;
 	compactionUsage?: AssistantUsage;
 	toolUsage?: AssistantUsage;
@@ -38,6 +43,18 @@ function createSession(options: {
 				usage,
 			},
 		});
+	}
+
+	for (const additional of options.additionalUsage ?? []) {
+		entries.push({ type: "message", message: { role: "assistant", usage: additional } });
+	}
+
+	if (options.usageEntry !== undefined) {
+		entries.push({ type: "usage", usage: options.usageEntry });
+	}
+
+	for (const snapshot of options.snapshots ?? []) {
+		entries.push({ type: "custom", customType: "subagent-usage", data: snapshot });
 	}
 
 	if (options.branchUsage !== undefined) {
@@ -113,7 +130,7 @@ describe("formatCwdForFooter", () => {
 
 	it("abbreviates the home directory and descendants", () => {
 		expect(formatCwdForFooter("/home/user", "/home/user")).toBe("~");
-		expect(formatCwdForFooter("/home/user/project", "/home/user")).toBe("~/project");
+		expect(formatCwdForFooter("/home/user/project", "/home/user")).toBe(`~${sep}project`);
 	});
 });
 
@@ -220,7 +237,41 @@ describe("FooterComponent width handling", () => {
 		expect(stripAnsi(footer.render(120)[1])).toContain("$1.000");
 	});
 
-	it("shows the latest cache hit rate when cache usage is present", () => {
+	it("weights session-wide cache hit rate across parent messages, summaries, tools, and workers", () => {
+		const session = createSession({
+			sessionName: "",
+			usage: { input: 10, output: 1, cacheRead: 10, cacheWrite: 0, cost: { total: 1 } },
+			additionalUsage: [{ input: 20, output: 2, cacheRead: 0, cacheWrite: 0, cost: { total: 2 } }],
+			branchUsage: { input: 0, output: 3, cacheRead: 10, cacheWrite: 0, cost: { total: 3 } },
+			compactionUsage: { input: 5, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 4 } },
+			toolUsage: { input: 0, output: 4, cacheRead: 5, cacheWrite: 0, cost: { total: 5 } },
+			usageEntry: { input: 0, output: 0, cacheRead: 0, cacheWrite: 5, cost: { total: 6 } },
+			snapshots: [
+				{ workerId: "one", usage: { input: 0, output: 6, cacheRead: 20, cacheWrite: 0, cost: 7 } },
+				{ workerId: "two", usage: { input: 0, output: 7, cacheRead: 10, cacheWrite: 5, cost: 8 } },
+			],
+		});
+		const stats = stripAnsi(new FooterComponent(session, createFooterData(1)).render(160)[1]);
+		expect(stats).toContain("CH55.0%");
+		expect(stats).toContain("$36.000");
+		expect(stats).toContain("↓23");
+	});
+
+	it("restores latest cumulative worker snapshots without recounting earlier runs", () => {
+		const worker = (workerId: string, input: number, cost: number) => ({
+			workerId,
+			usage: { input, output: 1, cacheRead: 0, cacheWrite: 0, cost },
+		});
+		const snapshots = [worker("one", 10, 1), worker("two", 20, 2), worker("one", 30, 3)];
+		const footer = new FooterComponent(createSession({ sessionName: "", snapshots }), createFooterData(1));
+		expect(stripAnsi(footer.render(120)[1])).toContain("$5.000");
+		footer.setSession(createSession({ sessionName: "restored", snapshots }));
+		const restored = stripAnsi(footer.render(120)[1]);
+		expect(restored).toContain("↑50");
+		expect(restored).toContain("$5.000");
+	});
+
+	it("shows the weighted cache hit rate when cache usage is present", () => {
 		const session = createSession({
 			sessionName: "",
 			usage: {
@@ -235,6 +286,14 @@ describe("FooterComponent width handling", () => {
 
 		const statsLine = stripAnsi(footer.render(120)[1]);
 		expect(statsLine).toContain("CH25.0%");
+	});
+
+	it("displays zero cache hits when prompts had no cached tokens", () => {
+		const session = createSession({
+			sessionName: "",
+			usage: { input: 100, output: 5, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } },
+		});
+		expect(stripAnsi(new FooterComponent(session, createFooterData(1)).render(120)[1])).toContain("CH0.0%");
 	});
 
 	it("marks Kimi Coding costs as subscription estimates", () => {

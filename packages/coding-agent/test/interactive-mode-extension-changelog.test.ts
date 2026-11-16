@@ -117,6 +117,16 @@ describe("InteractiveMode extension changelog", () => {
 		expect(settingsManager.getExtensionChangelogVersion(getSourcePackageKey(sourceInfo))).toBe("1.0.0");
 	});
 
+	test("acknowledges a package version even without matching changelog notes", () => {
+		writePackage("1.2.0");
+		display();
+		writePackage("1.3.0");
+
+		expect(display()).toEqual([]);
+		expect(settingsManager.getExtensionChangelogVersion(getSourcePackageKey(sourceInfo))).toBe("1.3.0");
+		expect(display()).toEqual([]);
+	});
+
 	test("shows entries newer than the last seen version, headed by package name", () => {
 		writePackage("1.0.0");
 		display();

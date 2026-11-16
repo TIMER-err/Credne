@@ -3,6 +3,8 @@ import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "..
 import { openBrowser } from "../../utils/open-browser.ts";
 import { ALL_POOL, accountDisplayName, accountProviderId, familyTitle, poolProviderId } from "./catalog.ts";
 import type { BrokerAccount, BrokerClient, BrokerLogin } from "./client.ts";
+import { sessionAccountCosts } from "./costs.ts";
+import { type AccountPanelResult, AccountsPanel } from "./panel.ts";
 import type { AccountProviderSpec } from "./provider.ts";
 import type { AccountRegistry } from "./registry.ts";
 
@@ -12,7 +14,7 @@ export interface AccountCommandDeps {
 	registry: AccountRegistry;
 }
 
-/** `/account` subcommands, also used for argument completion. */
+/** `/accounts` subcommands, also used for argument completion. */
 export const ACCOUNT_SUBCOMMANDS = [
 	"status",
 	"list",
@@ -56,9 +58,9 @@ interface AddFamily {
 }
 
 /**
- * What `/account add` offers: the first menu lists the families, the second the ways of one family;
+ * What `/accounts add` offers: the first menu lists the families, the second the ways of one family;
  * a family with a single way skips the second menu. `claude-api-credits` signs in to a Claude Console
- * organization through `ant`. The ids are the arguments of `/account add <id>`.
+ * organization through `ant`. The ids are the arguments of `/accounts add <id>`.
  */
 const ADD_FAMILIES: readonly AddFamily[] = [
 	{
@@ -113,7 +115,7 @@ const ADD_FAMILIES: readonly AddFamily[] = [
 	},
 ];
 
-/** Arguments of `/account add`, in menu order, for argument completion and the usage warning. */
+/** Arguments of `/accounts add`, in menu order, for argument completion and the usage warning. */
 export const ADD_ARGUMENTS: readonly { id: string; label: string }[] = ADD_FAMILIES.flatMap((family) => [
 	family,
 	...family.ways,
@@ -122,40 +124,75 @@ export const ADD_ARGUMENTS: readonly { id: string; label: string }[] = ADD_FAMIL
 const LOGIN_TIMEOUT_MS = 5 * 60_000;
 const LOGIN_POLL_MS = 1_000;
 
-/** `/accounts`: list accounts with their state and manage one. */
+/** `/accounts`: browse accounts, pools, quotas and session estimates in one panel. */
 export async function showAccounts(deps: AccountCommandDeps, ctx: ExtensionCommandContext): Promise<void> {
-	const addLabel = "+ Add account";
-	const restartLabel = "Restart broker (reloads config.yaml)";
+	let selectedId: string | undefined;
 	for (;;) {
 		const accounts = await deps.registry.sync(ctx);
 		if (!ctx.hasUI) {
 			ctx.ui.notify(formatAccountList(accounts, ctx), "info");
 			return;
 		}
-		const options = [...accounts.map((account) => accountLine(account, ctx)), addLabel, restartLabel];
-		const choice = await ctx.ui.select(`Accounts (${accounts.length})`, options);
-		if (!choice) return;
-		if (choice === addLabel) {
-			await addAccount(deps, ctx, "");
-			continue;
-		}
-		if (choice === restartLabel) {
+		const entries = ctx.sessionManager.getEntries();
+		const result = await ctx.ui.custom<AccountPanelResult>(
+			(tui, theme, keybindings, done) =>
+				new AccountsPanel(tui, theme, keybindings, done, {
+					currentId: ctx.model?.provider,
+					selectedId,
+					entries: deps.registry.providers().map((spec) => {
+						const target = spec.target;
+						const account =
+							target.type === "account" ? accounts.find((entry) => entry.key === target.key) : undefined;
+						return {
+							id: spec.id,
+							name: spec.name,
+							state: account
+								? `${accountState(account)} · ${account.modelCount} models`
+								: `${spec.models.length} models · balanced pool`,
+							accountKey: account?.key,
+							disabled: spec.disabled,
+							costs: sessionAccountCosts(entries, spec.id),
+						};
+					}),
+					usage: (key, signal) => deps.client.accountUsage(key, signal),
+				}),
+		);
+		selectedId = result.selectedId;
+		if (result.action === "cancel") return;
+		if (result.action === "add") await addAccount(deps, ctx, "");
+		else if (result.action === "restart") {
 			await deps.client.shutdown();
 			ctx.ui.notify("Account broker stopped; it restarts on the next request.", "info");
-			continue;
+			return;
+		} else {
+			const spec = deps.registry.provider(result.selectedId);
+			if (!spec) continue;
+			if (result.action === "use") {
+				const models = providerModels(ctx, spec);
+				const model = models.find((entry) => entry.id === ctx.model?.id) ?? models[0];
+				if (model) await useModel(deps, ctx, spec, model);
+				else ctx.ui.notify(`${spec.name} reports no models.`, "warning");
+				return;
+			}
+			if (result.action === "model") {
+				const model = await chooseModel(ctx, spec, providerModels(ctx, spec));
+				if (model) await useModel(deps, ctx, spec, model);
+			} else {
+				const account = accounts.find((entry) => accountProviderId(entry.id) === spec.id);
+				if (account) await manageAccount(deps, ctx, account);
+			}
 		}
-		const account = accounts[options.indexOf(choice)];
-		if (account) await manageAccount(deps, ctx, account);
 	}
 }
 
-/** `/account <subcommand> [query]`. */
+/** `/accounts <subcommand> [query]`; no arguments opens the panel. */
 export async function runAccountCommand(
 	deps: AccountCommandDeps,
 	args: string,
 	ctx: ExtensionCommandContext,
 ): Promise<void> {
-	const [subcommand = "status", ...rest] = args.trim().split(/\s+/).filter(Boolean);
+	if (!args.trim()) return showAccounts(deps, ctx);
+	const [subcommand, ...rest] = args.trim().split(/\s+/).filter(Boolean);
 	const query = rest.join(" ");
 	switch (subcommand) {
 		case "status":
@@ -165,7 +202,7 @@ export async function runAccountCommand(
 			await showAccounts(deps, ctx);
 			return;
 		case "switch":
-			await switchAccount(deps, ctx, query, false);
+			await switchAccount(deps, ctx, query, true);
 			return;
 		case "default":
 			await switchAccount(deps, ctx, query, true);
@@ -183,7 +220,7 @@ export async function runAccountCommand(
 			return;
 		}
 	}
-	ctx.ui.notify(`Usage: /account [${ACCOUNT_SUBCOMMANDS.join("|")}] [account]`, "warning");
+	ctx.ui.notify(`Usage: /accounts [${ACCOUNT_SUBCOMMANDS.join("|")}] [account]`, "warning");
 }
 
 /** `/models [account]`: list the models of the session's account, or of another one, and switch. */
@@ -210,7 +247,7 @@ function showStatus(deps: AccountCommandDeps, ctx: ExtensionContext): void {
 	const spec = deps.registry.provider(model?.provider ?? "");
 	if (!model || !spec) {
 		const current = model ? `${model.provider}/${model.id}` : "no model";
-		ctx.ui.notify(`This session uses ${current}, not a broker account. Use /account switch.`, "info");
+		ctx.ui.notify(`This session uses ${current}, not a broker account. Use /accounts switch.`, "info");
 		return;
 	}
 	const routing =
@@ -234,7 +271,7 @@ async function manageAccount(
 	};
 	const choice = await ctx.ui.select(accountDisplayName(account), [...Object.values(actions), "Back"]);
 	const spec = deps.registry.provider(accountProviderId(account.id));
-	if (choice === actions.use && spec) await switchTo(deps, ctx, spec, false);
+	if (choice === actions.use && spec) await switchTo(deps, ctx, spec, true);
 	else if (choice === actions.model && spec) {
 		const model = await chooseModel(ctx, spec, providerModels(ctx, spec));
 		if (model) await useModel(deps, ctx, spec, model);
@@ -274,7 +311,7 @@ async function switchAccount(
 	await deps.registry.sync(ctx);
 	const providers = deps.registry.providers().filter((spec) => !spec.disabled);
 	if (providers.length === 0) {
-		ctx.ui.notify("No accounts yet. Add one with /account add.", "warning");
+		ctx.ui.notify("No accounts yet. Add one with /accounts add.", "warning");
 		return;
 	}
 	const matches = query ? matchProviders(providers, query) : providers;
@@ -301,7 +338,7 @@ async function useModel(
 	ctx: ExtensionCommandContext,
 	spec: AccountProviderSpec,
 	model: Model<Api>,
-	persist = false,
+	persist = true,
 ): Promise<void> {
 	const previous = ctx.model;
 	if (!(await deps.pi.setModel(model, { persist }))) {
@@ -339,7 +376,7 @@ async function addAccount(deps: AccountCommandDeps, ctx: ExtensionCommandContext
 	if (account) await finishAdding(deps, ctx, account, hadAccounts);
 }
 
-/** The way to add an account, from the argument of `/account add` or from the menus; undefined when cancelled. */
+/** The way to add an account, from the argument of `/accounts add` or from the menus; undefined when cancelled. */
 async function chooseAddWay(ctx: ExtensionCommandContext, argument: string): Promise<AddWay | undefined> {
 	if (!argument) return chooseFromMenus(ctx);
 	const family = ADD_FAMILIES.find((entry) => entry.id === argument);
@@ -452,7 +489,10 @@ async function finishAdding(
 	hadAccounts: boolean,
 ): Promise<void> {
 	await deps.registry.sync(ctx);
-	ctx.ui.notify(`Added ${accountDisplayName(account)}. It funds the matching pools; /account switch pins it.`, "info");
+	ctx.ui.notify(
+		`Added ${accountDisplayName(account)}. It funds the matching pools; /accounts switch pins it.`,
+		"info",
+	);
 	if (!hadAccounts) await adoptPoolAsDefault(deps, ctx);
 }
 
@@ -545,7 +585,7 @@ function accountLine(account: BrokerAccount, ctx: ExtensionContext): string {
 }
 
 function formatAccountList(accounts: readonly BrokerAccount[], ctx: ExtensionContext): string {
-	if (accounts.length === 0) return "No accounts. Add one with /account add in interactive mode.";
+	if (accounts.length === 0) return "No accounts. Add one with /accounts add in interactive mode.";
 	return accounts.map((account) => accountLine(account, ctx)).join("\n");
 }
 

@@ -10,12 +10,13 @@ export function registerModelSearch(pi: ExtensionAPI, dispatch: SubagentDispatch
 		name: "search_models",
 		label: "Search models",
 		description:
-			"Find configured models for subagent or assign_tasks calls. Defaults to the current serving account, including when the parent uses a pool. Search IDs or display names, for example query: 'luna', or sort by cost to find cheaper models. Results include exact IDs and reasoning levels. Use this tool yourself instead of asking the user to look up model settings. Leave provider omitted to stay on the current account; specify another provider only when intentionally changing accounts.",
+			"Discover configured chat models on the current serving account. Defaults to five compact, cost-ranked results; use detail: 'full' for metadata, or query, sort, provider, limit and offset to refine. Costs are USD per million tokens; zero input and output rates may mean unknown, not free. Use the bare modelId portion of a result ID for same-account dispatch.",
 		parameters: Type.Object({
 			query: Type.Optional(Type.String({ description: "Case insensitive substring of a model ID or display name" })),
 			provider: Type.Optional(Type.String({ description: "Optional explicit account, pool or provider override" })),
 			sort: Type.Optional(Type.Union([Type.Literal("name"), Type.Literal("cost")])),
-			limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100, default: 20 })),
+			detail: Type.Optional(Type.Union([Type.Literal("compact"), Type.Literal("full")], { default: "compact" })),
+			limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100, default: 5 })),
 			offset: Type.Optional(Type.Integer({ minimum: 0, default: 0 })),
 		}),
 		async execute(_id, params, _signal, _update, ctx) {
@@ -24,12 +25,21 @@ export function registerModelSearch(pi: ExtensionAPI, dispatch: SubagentDispatch
 			const matches = pool.models.filter((model) =>
 				`${model.provider}/${model.id}\n${model.name}`.toLowerCase().includes(query),
 			);
+			const sort = params.sort ?? "cost";
 			matches.sort((a, b) => {
-				const cost = params.sort === "cost" ? a.cost.input + a.cost.output - b.cost.input - b.cost.output : 0;
-				return cost || a.name.localeCompare(b.name) || a.id.localeCompare(b.id);
+				if (sort === "cost") {
+					const aUnknown = a.cost.input === 0 && a.cost.output === 0;
+					const bUnknown = b.cost.input === 0 && b.cost.output === 0;
+					if (aUnknown !== bUnknown) return aUnknown ? 1 : -1;
+					if (!aUnknown) {
+						const price = a.cost.input + a.cost.output - b.cost.input - b.cost.output;
+						if (price !== 0) return price;
+					}
+				}
+				return a.name.localeCompare(b.name) || a.id.localeCompare(b.id);
 			});
 			const offset = params.offset ?? 0;
-			const page = matches.slice(offset, offset + (params.limit ?? 20));
+			const page = matches.slice(offset, offset + (params.limit ?? 5));
 			const nextOffset = offset + page.length;
 			const details = {
 				provider: pool.provider,
@@ -45,9 +55,25 @@ export function registerModelSearch(pi: ExtensionAPI, dispatch: SubagentDispatch
 					cost: model.cost,
 				})),
 				nextOffset: nextOffset < matches.length ? nextOffset : undefined,
-				note: "Costs are configured rates per million tokens. Zero may mean unknown pricing. Bare model IDs and unique names stay on the current account. Use an exact result ID to select a model. Refine query or use nextOffset for more results.",
+				note: "Costs are configured USD rates per million tokens. Zero input and output rates may mean unknown, not free. Use the exact provider/model ID to identify a result; pass its bare modelId to dispatch on the current account. Refresh discovery after the model or account changes, or if dispatch fails.",
 			};
-			return { content: [{ type: "text", text: JSON.stringify(details, null, 2) }], details };
+			const result =
+				params.detail === "full"
+					? details
+					: {
+							...details,
+							models: page.map((model) => ({
+								id: `${model.provider}/${model.id}`,
+								reasoningEfforts: getSupportedThinkingLevels(model),
+								contextWindow: model.contextWindow,
+								cost: {
+									input: model.cost.input,
+									output: model.cost.output,
+									cacheRead: model.cost.cacheRead,
+								},
+							})),
+						};
+			return { content: [{ type: "text", text: JSON.stringify(result) }], details };
 		},
 	});
 }

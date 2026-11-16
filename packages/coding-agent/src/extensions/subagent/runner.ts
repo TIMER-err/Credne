@@ -9,6 +9,7 @@ import { Value } from "typebox/value";
 import { APP_NAME } from "../../config.ts";
 import { CURRENT_SESSION_VERSION, type SessionHeader } from "../../core/session-manager.ts";
 import { withFileMutationQueue } from "../../core/tools/file-mutation-queue.ts";
+import { createUsageTotals, type UsageTotals } from "../../core/usage-totals.ts";
 import type { JsonAgentSessionEvent } from "../../modes/json-event.ts";
 import { attachJsonlLineReader, serializeJsonLine } from "../../modes/rpc/jsonl.ts";
 import type { RpcCommand, RpcResponse } from "../../modes/rpc/rpc-types.ts";
@@ -64,6 +65,9 @@ export interface SubagentDetails {
 }
 
 export type OnUpdateCallback = (partial: AgentToolResult<SubagentDetails>) => void;
+
+/** Called with a worker's cumulative billable usage, including costs outside active runs. */
+export type OnUsageCallback = (usage: UsageTotals) => void;
 
 export interface DispatchDefaults {
 	context: SubagentContextSnapshot;
@@ -172,8 +176,9 @@ export function createWorkerSession(
 	agentName: string,
 	channel: WorkerChannel,
 	warmup: PrefixWarmup,
+	onUsage?: OnUsageCallback,
 ): WorkerSession {
-	return new ProcessWorker(defaults, resolved, agentName, channel, warmup);
+	return new ProcessWorker(defaults, resolved, agentName, channel, warmup, onUsage);
 }
 
 /** Runs one disposable worker while preserving the existing single invocation API. */
@@ -212,6 +217,8 @@ class ProcessWorker implements WorkerSession {
 	private agentName: string;
 	private channel: WorkerChannel;
 	private warmup: PrefixWarmup;
+	private onUsage?: OnUsageCallback;
+	private lifetimeUsage = createUsageTotals();
 	private process?: ChildProcess;
 	private processClosed = true;
 	private tempDir?: string;
@@ -235,12 +242,14 @@ class ProcessWorker implements WorkerSession {
 		agentName: string,
 		channel: WorkerChannel,
 		warmup: PrefixWarmup,
+		onUsage?: OnUsageCallback,
 	) {
 		this.defaults = defaults;
 		this.resolved = resolved;
 		this.agentName = agentName;
 		this.channel = channel;
 		this.warmup = warmup;
+		this.onUsage = onUsage;
 	}
 
 	async run(
@@ -497,15 +506,19 @@ class ProcessWorker implements WorkerSession {
 			return;
 		}
 		const active = this.active;
-		if (!active) return;
 		if (event.type === "entry_appended") {
 			const entry = event.entry;
-			if (entry.type === "usage" && entry.kind === "cache_warm") {
-				recordUsage(active.result.usage, entry.usage);
-				active.update();
+			const usage =
+				entry.type === "usage" || entry.type === "branch_summary" || entry.type === "compaction"
+					? entry.usage
+					: undefined;
+			if (usage) {
+				this.recordBillableUsage(usage, active);
+				active?.update();
 			}
 			return;
 		}
+		if (!active) return;
 		if (event.type === "agent_settled") {
 			active.accepting = false;
 			active.settled = true;
@@ -519,8 +532,22 @@ class ProcessWorker implements WorkerSession {
 		active.result.messages.push(message);
 		if (message.role === "assistant") {
 			recordAssistant(active.result, message);
+			this.recordBillableUsage(message.usage);
+		} else if (message.role === "toolResult" && message.usage) {
+			this.recordBillableUsage(message.usage, active);
 		}
 		active.update();
+	}
+
+	private recordBillableUsage(usage: Usage, active?: ActiveRun): void {
+		if (active) recordUsage(active.result.usage, usage);
+		if (!usage.input && !usage.output && !usage.cacheRead && !usage.cacheWrite && !usage.cost.total) return;
+		this.lifetimeUsage.input += usage.input;
+		this.lifetimeUsage.output += usage.output;
+		this.lifetimeUsage.cacheRead += usage.cacheRead;
+		this.lifetimeUsage.cacheWrite += usage.cacheWrite;
+		this.lifetimeUsage.cost += usage.cost.total;
+		this.onUsage?.({ ...this.lifetimeUsage });
 	}
 
 	private endWarmup(active: ActiveRun, isWarm: boolean): void {

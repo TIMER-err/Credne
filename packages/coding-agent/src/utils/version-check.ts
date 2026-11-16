@@ -1,13 +1,12 @@
 import { compare, valid } from "semver";
+import { CREDNE_RELEASES_API_URL } from "../config.ts";
 import { fetchWithRetry } from "./management-http.ts";
 import { getPiUserAgent } from "./pi-user-agent.ts";
 
-const LATEST_VERSION_URL = "https://pi.dev/api/latest-version";
 const DEFAULT_VERSION_CHECK_TIMEOUT_MS = 10000;
 
 export interface LatestPiRelease {
 	version: string;
-	packageName?: string;
 	note?: string;
 }
 
@@ -48,6 +47,7 @@ export function isNewerPackageVersion(candidateVersion: string, currentVersion: 
 	return candidateVersion.trim() !== currentVersion.trim();
 }
 
+/** Fetch the latest published stable Credne release; invalid, draft, and prerelease payloads are ignored. */
 export async function getLatestPiRelease(
 	currentVersion: string,
 	options: { timeoutMs?: number; retry?: boolean } = {},
@@ -55,11 +55,11 @@ export async function getLatestPiRelease(
 	if (process.env.PI_OFFLINE) return undefined;
 
 	const response = await fetchWithRetry(
-		LATEST_VERSION_URL,
+		CREDNE_RELEASES_API_URL,
 		{
 			headers: {
 				"User-Agent": getPiUserAgent(currentVersion),
-				accept: "application/json",
+				accept: "application/vnd.github+json",
 			},
 		},
 		{
@@ -69,22 +69,21 @@ export async function getLatestPiRelease(
 	);
 	if (!response.ok) return undefined;
 
-	const data = (await response.json()) as {
-		packageName?: unknown;
-		version?: unknown;
-		note?: unknown;
-	};
-	if (typeof data.version !== "string" || !data.version.trim()) {
+	const data: unknown = await response.json();
+	if (typeof data !== "object" || data === null) return undefined;
+	const release = data as Record<string, unknown>;
+	if (release.draft !== false || release.prerelease !== false || typeof release.published_at !== "string") {
 		return undefined;
 	}
-	const packageName =
-		typeof data.packageName === "string" && data.packageName.trim() ? data.packageName.trim() : undefined;
-	const note = typeof data.note === "string" && data.note.trim() ? data.note.trim() : undefined;
-	return {
-		version: data.version.trim(),
-		packageName,
-		...(note ? { note } : {}),
-	};
+	if (typeof release.tag_name !== "string") return undefined;
+
+	const version = release.tag_name.trim().replace(/^v/, "");
+	const parsedVersion = valid(version);
+	if (!parsedVersion || parsedVersion !== version || version.includes("-")) {
+		return undefined;
+	}
+	const note = typeof release.body === "string" && release.body.trim() ? release.body.trim() : undefined;
+	return { version, ...(note ? { note } : {}) };
 }
 
 export async function getLatestPiVersion(

@@ -207,6 +207,7 @@ export const SettingsSchema = Type.Object(
 	{
 		$schema: Type.Optional(Type.String({ description: "JSON Schema reference." })),
 		lastChangelogVersion: Type.Optional(Type.String()),
+		lastUpdateNotificationVersion: Type.Optional(Type.String()),
 		extensionChangelogVersions: Type.Optional(
 			Type.Record(Type.String(), Type.String(), {
 				description: "Last seen changelog version per extension package.",

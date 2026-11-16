@@ -74,11 +74,11 @@ Every account has a family and a kind. The kind decides how the account authenti
 
 | Account | Pi entry | Broker `kind` | Credential storage | Executor |
 | --- | --- | --- | --- | --- |
-| Claude subscription | `/account add claude-subscription` | `oauth` (provider `claude`) | `<home>/auths` | CLIProxyAPI Claude executor (Claude Code request emulation) |
-| Claude API credits | `/account add claude-api-credits` | `api-credits` (provider `claude-api`) | `<home>/ant` (ant profile) | `claude-api` |
-| Claude API key | `/account add claude-api-key` | `api-key` (provider `claude-api`) | `<home>/api-accounts.json` | `claude-api` |
-| ChatGPT subscription | `/account add codex` | `oauth` (provider `codex`) | `<home>/auths` | CLIProxyAPI Codex executor ("Sign in with ChatGPT") |
-| OpenAI API key | `/account add openai-api-key` | `api-key` (provider `openai-api`) | `<home>/api-accounts.json` | `openai-api` |
+| Claude subscription | `/accounts add claude-subscription` | `oauth` (provider `claude`) | `<home>/auths` | CLIProxyAPI Claude executor (Claude Code request emulation) |
+| Claude API credits | `/accounts add claude-api-credits` | `api-credits` (provider `claude-api`) | `<home>/ant` (ant profile) | `claude-api` |
+| Claude API key | `/accounts add claude-api-key` | `api-key` (provider `claude-api`) | `<home>/api-accounts.json` | `claude-api` |
+| ChatGPT subscription | `/accounts add codex` | `oauth` (provider `codex`) | `<home>/auths` | CLIProxyAPI Codex executor ("Sign in with ChatGPT") |
+| OpenAI API key | `/accounts add openai-api-key` | `api-key` (provider `openai-api`) | `<home>/api-accounts.json` | `openai-api` |
 | Config-file API key | `api-keys` in `<home>/config.yaml` | `api-key` | `config.yaml` | CLIProxyAPI |
 
 Config-file accounts are read-only through the broker API. Disable, enable and delete return 409 for them, and the user edits `config.yaml` and restarts the broker instead. Clearing a cooldown still works on them. Accounts added through the broker are stored by the broker itself, so their secrets never enter CLIProxyAPI's store.
@@ -177,6 +177,7 @@ The base URL and token come from `<home>/broker.json`, written atomically with o
 | `POST /credne/v1/shutdown` | Stop the broker for all harness processes |
 | `GET /credne/v1/accounts` | Accounts: id, key, provider, kind, source, label, email, plan, status, disabled, quota and cooldown, last error, model count. Never credentials. |
 | `GET /credne/v1/accounts/{key}/models` | Models the account can serve |
+| `GET /credne/v1/accounts/{key}/usage` | Normalized live subscription quota windows and supported provider-reported credits, or an explicit unavailable/unsupported reason. Never credentials or raw upstream bodies. |
 | `POST /credne/v1/accounts/{key}/disable`, `/enable` | Toggle an account |
 | `POST /credne/v1/accounts/{key}/reset` | Clear cooldown and quota state |
 | `DELETE /credne/v1/accounts/{key}` | Remove a subscription account and its stored credential, or a broker-managed API account. For API-credit accounts, also runs `ant auth logout`. |
@@ -190,6 +191,16 @@ The base URL and token come from `<home>/broker.json`, written atomically with o
 | `POST /credne/v1/route/{target}/chat/completions` | Chat Completions, translated by CLIProxyAPI for providers without a native Pi adapter |
 
 `{target}` is `a.<key>` for a pinned account or `p.<name>` for a pool. Responses are SSE in the request's protocol. Errors use the protocol's own envelope (Anthropic `{"type":"error","error":{...}}`, OpenAI `{"error":{...}}`). They carry the upstream status and `Retry-After`, and they name the account, for example `account a@example.com (claude): rate limited`.
+
+## Live subscription usage
+
+`usage.go` queries only `https://api.anthropic.com/api/oauth/usage` for Claude OAuth subscriptions and `https://chatgpt.com/backend-api/wham/usage` for Codex subscriptions. CLIProxyAPI v8 has no built-in live quota facade; the broker does not call plugin-only or removed management quota endpoints. API-key/API-credit accounts and other providers return `unsupported` with a reason without making a request.
+
+Requests use `AuthManager.NewHttpRequest` and `HttpRequest` with the selected auth, preserving executor credentials, proxy routing and provider transport. Claude requests include `anthropic-beta: oauth-2025-04-20`; Codex requests include the selected `Chatgpt-Account-Id` when present. A request-scoped transport guard allows only the fixed GET destination and suppresses redirects. Requests time out after 10 seconds, response bodies are bounded to 256 KiB, and errors expose only static reasons or HTTP status, not provider bodies or transport diagnostics.
+
+The response has `status: available|unavailable|unsupported`, a `reason` for non-available results, `windows: [{label, usedPercent, resetAt?}]`, and `credits: [{label, amount?, unit, unlimited?}]`. Missing percentages are omitted rather than fabricated as zero; missing reset times stay missing. Claude extra-usage figures retain provider credit units, and Codex balances retain provider credits; the broker does not infer currency conversions or billed subscription charges. Only allowlisted fields are returned. The account panel displays resets in local time.
+
+Quota windows and credits are provider subscription data, not estimates from session tokens. The harness separately sums recorded `AssistantMessage.usage.cost` for the selected pinned provider and labels it as session API-rate estimates, never subscription billing. Pool response costs remain separately labeled unattributed; the current serving account is not used to guess historical attribution.
 
 ## Guarantees
 

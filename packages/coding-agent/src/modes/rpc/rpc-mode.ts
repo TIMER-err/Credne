@@ -219,6 +219,18 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			// Custom header not supported in RPC mode - requires TUI access
 		},
 
+		setMainView(_view: unknown): void {
+			// Main view replacement not supported in RPC mode - requires TUI access
+		},
+
+		setSidePanelSection(_key: string, _factory: unknown, _options?: { order?: number }): void {
+			// Side panel sections not supported in RPC mode - requires TUI access
+		},
+
+		isSidePanelOpen(): boolean {
+			return false;
+		},
+
 		setTitle(title: string): void {
 			// Fire and forget - host can implement terminal title control
 			output({

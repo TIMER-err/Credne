@@ -33,6 +33,37 @@ describe("CustomEditor prompt history keybindings", () => {
 	});
 });
 
+describe("CustomEditor inline agent selection", () => {
+	it("selects agents with Down only when the prompt is empty and autocomplete is closed", () => {
+		const keybindings = new KeybindingsManager();
+		setKeybindings(keybindings);
+		const editor = new CustomEditor(new TuiMainScreen(new VirtualTerminal()), defaultEditorTheme, keybindings);
+		const selectAgents = vi.fn();
+		editor.onAction("app.subagents.select", selectAgents);
+
+		editor.handleInput("\x1b[B");
+		expect(selectAgents).toHaveBeenCalledTimes(1);
+
+		editor.setText("draft");
+		editor.handleInput("\x1b[B");
+		expect(selectAgents).toHaveBeenCalledTimes(1);
+		expect(editor.getText()).toBe("draft");
+
+		editor.setText("");
+		const autocomplete = vi.spyOn(editor, "isShowingAutocomplete").mockReturnValue(true);
+		editor.handleInput("\x1b[B");
+		expect(selectAgents).toHaveBeenCalledTimes(1);
+		autocomplete.mockRestore();
+
+		keybindings.setUserBindings({ "app.subagents.select": "ctrl+j" });
+		setKeybindings(keybindings);
+		editor.handleInput("\x1b[B");
+		expect(selectAgents).toHaveBeenCalledTimes(1);
+		editor.handleInput("\x0a");
+		expect(selectAgents).toHaveBeenCalledTimes(2);
+	});
+});
+
 describe("CustomEditor selection page keybindings", () => {
 	it("pages an open autocomplete menu before pasting an image with the same key (#7629)", async () => {
 		// Bind both explicitly: the paste default is Alt+V on Windows and WSL.

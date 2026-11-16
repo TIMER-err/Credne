@@ -233,6 +233,7 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 	private selectionDragged = false;
 	private mouseCapture?: TuiMouseDispatchTarget;
 	private mousePressTarget?: TuiMouseDispatchTarget;
+	private hoverTarget?: TuiMouseDispatchTarget;
 	private mousePressPoint?: { x: number; y: number };
 	private mousePressMoved = false;
 	private lastComponentClick?: {
@@ -388,6 +389,7 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 
 	protected override beforeTerminalStop(_options: TuiStopOptions): void {
 		this.closeSearch();
+		this.hoverTarget = undefined;
 		this.stopSelectionAutoScroll();
 		this.selectionPressActive = false;
 		this.stopScrollbarHover();
@@ -698,6 +700,7 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 			this.selectionPressActive = false;
 			this.stopSelectionAutoScroll();
 			this.stopScrollbarHover();
+			this.setHoverTarget(undefined, 0, 0);
 			if (this.activeSearch?.component.setHoveredNavigationDirection(undefined)) this.requestRender();
 			this.stopScrollbarDrag();
 			this.pressedUrl = undefined;
@@ -879,6 +882,15 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		);
 	}
 
+	/** Sends `leave` to the previous hover target when the pointer is no longer over it. */
+	private setHoverTarget(target: TuiMouseDispatchTarget | undefined, x: number, y: number): void {
+		const previous = this.hoverTarget;
+		this.hoverTarget = target;
+		if (!previous || previous.component === target?.component) return;
+		this.dispatchMouseToTarget(this.createMouseEvent("leave", 3, x, y), previous);
+		this.requestRender();
+	}
+
 	private dispatchMouseToTarget(
 		event: TuiMouseEvent,
 		target: TuiMouseDispatchTarget,
@@ -922,6 +934,16 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 					: "drag"
 				: "press";
 		const event = this.createMouseEvent(type, raw.button, raw.x, raw.y);
+		const hover = this.hoverTarget;
+		if (
+			hover &&
+			(raw.x < hover.originX ||
+				raw.y < hover.originY ||
+				raw.x >= hover.originX + hover.width ||
+				raw.y >= hover.originY + hover.height)
+		) {
+			this.setHoverTarget(undefined, raw.x, raw.y);
+		}
 
 		if (this.mouseCapture || this.mousePressTarget) {
 			const target = this.mouseCapture ?? this.mousePressTarget!;
@@ -959,6 +981,7 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		}
 
 		const result = overlay.result ?? (overlay.hit ? undefined : this.dispatchMouseToLayout(event));
+		if (type === "move") this.setHoverTarget(result?.target, raw.x, raw.y);
 		if (result) {
 			const render = this.applyMouseDispatchResult(event, result);
 			if (type === "press") {

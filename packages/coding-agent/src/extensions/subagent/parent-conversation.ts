@@ -4,6 +4,7 @@
 // bytes, so the provider can cache it once for both.
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
+import { filterFailedMessages } from "../../core/messages.ts";
 
 /** Opening tag of the stripped conversation. The worker cache marks the block that starts with it. */
 export const PARENT_CONVERSATION_TAG = "<parent_conversation";
@@ -14,7 +15,7 @@ export const PARENT_CONVERSATION_TAG = "<parent_conversation";
  * shortened) and a tool output its first characters, with a note of how many were cut.
  */
 export function renderParentConversation(messages: AgentMessage[]): string {
-	const lines = messages.flatMap(renderMessage);
+	const lines = filterFailedMessages(messages).flatMap(renderMessage);
 	return [
 		`${PARENT_CONVERSATION_TAG} note="The main agent's conversation, given for reference. Tool outputs are shortened.">`,
 		...lines,

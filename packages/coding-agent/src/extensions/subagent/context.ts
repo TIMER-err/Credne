@@ -23,7 +23,6 @@ export const subagentContextResultSchema = Type.Object({
 				Type.Literal("task_result"),
 				Type.Literal("subagent_result"),
 				Type.Literal("agent_message"),
-				Type.Literal("task_review"),
 				Type.Literal("step"),
 			]),
 			preview: Type.String(),
@@ -48,7 +47,7 @@ interface ContextCheckpoints {
 	safeEnd: number;
 }
 
-/** Lists safe conversation, worker report, communication, review and named step checkpoints. */
+/** Lists safe conversation, worker report, communication, task completion and named step checkpoints. */
 export function listSubagentContext(ctx: ExtensionContext): SubagentContextResult {
 	const { checkpoints } = scanCheckpoints(ctx.sessionManager.getBranch());
 	return { turns: checkpoints.map(({ label }, index) => ({ turn: index + 1, ...label })) };
@@ -114,8 +113,11 @@ function checkpointLabel(entry: SessionEntry, calls: Map<string, ToolCall>): Che
 	}
 	if (message.role !== "toolResult" || message.isError) return undefined;
 	const call = calls.get(message.toolCallId);
-	if (call?.name === "review_task")
-		return { kind: "task_review", preview: reviewPreview(call.arguments, message.content) };
+	if (call?.name === "task_update" && Value.Check(completedTaskArgumentsSchema, call.arguments))
+		return {
+			kind: "task_result",
+			preview: `Completed task ${call.arguments.taskId}: ${call.arguments.output}`.slice(0, 200),
+		};
 	if (call?.name === "checkpoint_context") return stepCheckpoint(call.arguments);
 	return undefined;
 }
@@ -137,17 +139,11 @@ function customCheckpoint(
 	}
 }
 
-const reviewArgumentsSchema = Type.Object({
+const completedTaskArgumentsSchema = Type.Object({
 	taskId: Type.String(),
-	verdict: Type.Union([Type.Literal("accept"), Type.Literal("reject")]),
+	status: Type.Literal("done"),
+	output: Type.String(),
 });
-
-function reviewPreview(args: unknown, content: (TextContent | ImageContent)[]): string {
-	// Tool arguments persisted in history are a disk boundary, not schema-checked live arguments.
-	if (Value.Check(reviewArgumentsSchema, args))
-		return `${args.verdict === "accept" ? "Accepted" : "Rejected"} task ${args.taskId}`.slice(0, 200);
-	return boundedPreview(`Review task completed: ${boundedPreview(content)}`);
-}
 
 const stepArgumentsSchema = Type.Object({ name: Type.String(), description: Type.Optional(Type.String()) });
 

@@ -1,4 +1,11 @@
-import { Editor, type EditorOptions, type EditorTheme, type TUI, visibleWidth } from "@earendil-works/pi-tui";
+import {
+	Editor,
+	type EditorOptions,
+	type EditorTheme,
+	type TUI,
+	truncateToWidth,
+	visibleWidth,
+} from "@earendil-works/pi-tui";
 import type { AppKeybinding, KeybindingsManager } from "../../../core/keybindings.ts";
 import type { StatusIndicator } from "./status-indicator.ts";
 
@@ -13,6 +20,7 @@ export type CustomEditorOptions = EditorOptions & {
 export class CustomEditor extends Editor {
 	private keybindings: KeybindingsManager;
 	private workingStatusIndicator: StatusIndicator | undefined;
+	private borderBadge: string | undefined;
 	public readonly embedWorkingStatus: boolean;
 	public actionHandlers: Map<AppKeybinding, () => void> = new Map();
 
@@ -33,12 +41,24 @@ export class CustomEditor extends Editor {
 		this.workingStatusIndicator = indicator;
 	}
 
+	/** Show a styled badge at the right end of the top border, or remove it with undefined. */
+	setBorderBadge(badge: string | undefined): void {
+		this.borderBadge = badge;
+	}
+
 	protected override renderTopBorder(width: number, hiddenLineCount: number): string {
-		if (!this.embedWorkingStatus || !this.workingStatusIndicator || width <= 0) {
+		// The badge keeps at most half the border so the working status stays readable.
+		const badge = this.borderBadge && width >= 12 ? truncateToWidth(this.borderBadge, Math.floor(width / 2)) : "";
+		return this.renderStatusBorder(width - visibleWidth(badge), hiddenLineCount) + badge;
+	}
+
+	private renderStatusBorder(width: number, hiddenLineCount: number): string {
+		const indicator = this.workingStatusIndicator;
+		if (!this.embedWorkingStatus || !indicator || width <= 0) {
 			return super.renderTopBorder(width, hiddenLineCount);
 		}
 
-		let status = this.workingStatusIndicator.renderInBorder(Math.max(1, width - 5));
+		let status = indicator.renderInBorder(Math.max(1, width - 5));
 		let statusWidth = visibleWidth(status);
 		if (statusWidth === 0) return super.renderTopBorder(width, hiddenLineCount);
 
@@ -49,7 +69,7 @@ export class CustomEditor extends Editor {
 			overflowLabel !== undefined && overflowLabelWidth + 2 <= width && overflowStart - (3 + statusWidth + 1) >= 1;
 
 		if (overflowLabel && !canFitOverflow()) {
-			status = this.workingStatusIndicator.renderSpinnerInBorder(width);
+			status = indicator.renderSpinnerInBorder(width);
 			statusWidth = visibleWidth(status);
 		}
 
@@ -68,7 +88,7 @@ export class CustomEditor extends Editor {
 			return this.borderColor("── ") + status + this.borderColor(` ${"─".repeat(width - statusWidth - 4)}`);
 		}
 
-		status = this.workingStatusIndicator.renderSpinnerInBorder(width);
+		status = indicator.renderSpinnerInBorder(width);
 		statusWidth = visibleWidth(status);
 		const prefixWidth = Math.min(3, Math.max(0, width - statusWidth));
 		return (
@@ -144,9 +164,26 @@ export class CustomEditor extends Editor {
 			return;
 		}
 
+		if (
+			this.keybindings.matches(data, "app.subagents.select") &&
+			this.getText().length === 0 &&
+			!this.isShowingAutocomplete()
+		) {
+			const handler = this.actionHandlers.get("app.subagents.select");
+			if (handler) {
+				handler();
+				return;
+			}
+		}
+
 		// Check all other app actions
 		for (const [action, handler] of this.actionHandlers) {
-			if (action !== "app.interrupt" && action !== "app.exit" && this.keybindings.matches(data, action)) {
+			if (
+				action !== "app.interrupt" &&
+				action !== "app.exit" &&
+				action !== "app.subagents.select" &&
+				this.keybindings.matches(data, action)
+			) {
 				handler();
 				return;
 			}

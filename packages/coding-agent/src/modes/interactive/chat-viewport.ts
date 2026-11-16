@@ -1,4 +1,4 @@
-import { type Component, ScrollView, type ScrollViewScrollbar, VStack } from "@earendil-works/pi-tui";
+import { type Component, HStack, ScrollView, type ScrollViewScrollbar, VStack } from "@earendil-works/pi-tui";
 
 export interface ChatViewportOptions {
 	readonly document: Component;
@@ -16,7 +16,14 @@ export interface ChatViewportOptions {
 export interface ChatViewport {
 	readonly root: Component;
 	readonly transcript: ScrollView;
+	/**
+	 * Put `spacer` beside the transcript, taking its width, or remove it with undefined. The input dock below keeps
+	 * the full width. Without a spacer the transcript is the first entry of the root itself, with no wrapper.
+	 */
+	setTranscriptSpacer(spacer: Component | undefined): void;
 }
+
+const fillEntry = { basis: 0, grow: 1, shrink: 1, minSize: 1 } as const;
 
 /** Shared fullscreen transcript and fixed input-dock layout. */
 export function createChatViewport(options: ChatViewportOptions): ChatViewport {
@@ -36,11 +43,29 @@ export function createChatViewport(options: ChatViewportOptions): ChatViewport {
 		...(options.widgetsBelow === undefined ? [] : [{ component: options.widgetsBelow, shrink: 1, minSize: 0 }]),
 		{ component: options.footer, shrink: 1, minSize: 0 },
 	]);
+	const root = new VStack();
+	const arrange = (transcriptRow: Component) => {
+		root.clear();
+		root.addChild(transcriptRow, fillEntry);
+		root.addChild(dock, { basis: "auto", grow: 0, shrink: 1, minSize: 1 });
+	};
+	arrange(transcript);
 	return {
 		transcript,
-		root: new VStack([
-			{ component: transcript, basis: 0, grow: 1, shrink: 1, minSize: 1 },
-			{ component: dock, basis: "auto", grow: 0, shrink: 1, minSize: 1 },
-		]),
+		root,
+		setTranscriptSpacer: (spacer) =>
+			arrange(
+				spacer === undefined
+					? transcript
+					: new HStack(
+							[
+								{ component: transcript, ...fillEntry },
+								{ component: spacer, basis: "auto", grow: 0, shrink: 0 },
+							],
+							{
+								align: "stretch",
+							},
+						),
+			),
 	};
 }

@@ -47,6 +47,10 @@ const APP_KEYBINDINGS = {
 		description: "Cycle to previous model",
 	},
 	"app.model.select": { defaultKeys: "ctrl+l", description: "Open model selector" },
+	"app.accounts.manage": { defaultKeys: "ctrl+o", description: "Manage the selected account" },
+	"app.accounts.model": { defaultKeys: "ctrl+l", description: "Choose a model on the selected account or pool" },
+	"app.accounts.refresh": { defaultKeys: "ctrl+r", description: "Refresh selected account usage" },
+	"app.subagents.select": { defaultKeys: "down", description: "Select agents below an empty prompt" },
 	"app.tools.expand": { defaultKeys: "ctrl+o", description: "Toggle tool output" },
 	"app.thinking.toggle": {
 		defaultKeys: "ctrl+t",
@@ -76,6 +80,18 @@ const APP_KEYBINDINGS = {
 		defaultKeys: windowsKeybindings ? ["alt+v", "ctrl+v"] : "ctrl+v",
 		description: "Paste files on macOS, images, or text from clipboard",
 	},
+	"app.sidePanel.toggle": { defaultKeys: [], description: "Toggle the side panel" },
+	// alt+up is the dequeue key outside Windows, so the panel moves to ctrl+alt there.
+	"app.sidePanel.nextFile": {
+		defaultKeys: windowsKeybindings ? "alt+down" : "ctrl+alt+down",
+		description: "Side panel: select next changed file",
+	},
+	"app.sidePanel.prevFile": {
+		defaultKeys: windowsKeybindings ? "alt+up" : "ctrl+alt+up",
+		description: "Side panel: select previous changed file",
+	},
+	"app.sidePanel.scrollDown": { defaultKeys: "alt+pageDown", description: "Side panel: scroll the diff down" },
+	"app.sidePanel.scrollUp": { defaultKeys: "alt+pageUp", description: "Side panel: scroll the diff up" },
 	"app.session.new": { defaultKeys: [], description: "Start a new session" },
 	"app.session.tree": { defaultKeys: [], description: "Open session tree" },
 	"app.session.fork": { defaultKeys: [], description: "Fork current session" },

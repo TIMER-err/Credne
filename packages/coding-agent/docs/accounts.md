@@ -12,11 +12,11 @@ cd broker && go build -o ~/.pi/agent/bin/credne-broker ./cmd/credne-broker
 
 Pi starts the broker on demand, and every Pi process shares it. The broker stops after 30 minutes without requests and starts again on the next one. Set `PI_ACCOUNTS_BROKER` to use a binary elsewhere.
 
-With no accounts configured, the extension registers no providers and does nothing. Add an account with `/account add`.
+With no accounts configured, the extension registers no providers. Open `/accounts` to add one, or run `/accounts add`.
 
 ## Adding accounts
 
-Run `/account add` and choose `Claude account` or `ChatGPT account`. The next menu lists the available login methods. Choose by how you pay for the models:
+Run `/accounts add` and choose `Claude account` or `ChatGPT account`. The next menu lists the available login methods. Choose by how you pay for the models:
 
 | Account | Way | What you do |
 | --- | --- | --- |
@@ -26,7 +26,7 @@ Run `/account add` and choose `Claude account` or `ChatGPT account`. The next me
 | ChatGPT | Subscription | Sign in with your ChatGPT account in the browser. |
 | ChatGPT | `API key (OpenAI API credits)` | Name the account, then paste an OpenAI API key. Requests use the official OpenAI API with that project's API billing. |
 
-Escape in either menu returns to the first menu. `/account add claude` and `/account add chatgpt` open their respective menus. Use `/account add openai-api-key` for an OpenAI API key, `/account add codex` for a ChatGPT subscription, or `/account add claude-subscription`, `claude-api-credits`, or `claude-api-key` for a Claude method.
+Escape in the method menu returns to the family menu; Escape there cancels. `/accounts add claude` and `/accounts add chatgpt` open their respective menus. Use `/accounts add openai-api-key` for an OpenAI API key, `/accounts add codex` for a ChatGPT subscription, or `/accounts add claude-subscription`, `claude-api-credits`, or `claude-api-key` for a Claude method.
 
 OpenAI API keys are registered as `openai-api` accounts with kind `api-key`. They use the official OpenAI API and never authenticate through Codex. Their family pool is `pool:openai`; ChatGPT subscription accounts stay in `pool:codex`.
 
@@ -75,16 +75,41 @@ A session on `acct:<id>` is pinned to one account. Every request uses that accou
 
 | Command | Effect |
 | --- | --- |
-| `/accounts` | Open the account list. Choose an account to use it in this session, choose a model, enable or disable it, clear its cooldown, or remove it. The list also has `+ Add account` and `Restart broker`. |
-| `/account` or `/account status` | Show whether this session uses a pinned account or a pool, and which provider and model it uses. |
-| `/account list` | Same as `/accounts`. |
-| `/account switch [account]` | Switch this session to an account or pool. The current model stays if the account offers it. Other sessions are not affected. |
-| `/account default [account]` | Switch this session and use the same account or pool for new sessions. |
-| `/account add [kind]` | Add an account. See "Adding accounts". |
-| `/account remove [account]` | Remove an account and delete its stored credential after confirmation. |
-| `/account enable\|disable [account]` | Turn an account on or off without removing it. |
-| `/account reset [account]` | Clear an account's cooldown and quota state, for example after you know its usage window has reset. |
+| `/accounts` | Open the accounts and pools panel with live usage and session cost estimates. |
+| `/accounts status` | Show whether this session uses a pinned account or a pool, and which provider and model it uses. |
+| `/accounts list` | Same as `/accounts`. |
+| `/accounts switch [account]` | Switch this session and remember the account or pool for new sessions. The current model stays if the account offers it. Other running sessions are not affected. |
+| `/accounts default [account]` | Same as `/accounts switch`. |
+| `/accounts add [kind]` | Add an account. See "Adding accounts". |
+| `/accounts remove [account]` | Remove an account and delete its stored credential after confirmation. |
+| `/accounts enable\|disable [account]` | Turn an account on or off without removing it. |
+| `/accounts reset [account]` | Clear an account's cooldown and quota state, for example after you know its usage window has reset. |
 | `/models [account]` | List the models of this session's provider. With an account name, list that account's models instead, and choose one to switch this session to it. |
+
+Selections in `/accounts`, `/models`, and `/model`, including model cycling, remember the model and account for the next new session across projects. Resuming an existing session restores that session's recorded selection; an explicit CLI model or project configuration can override the saved default.
+
+The singular `/account` command is no longer registered. All account commands and completions are under `/accounts`.
+
+### Panel controls
+
+- Up/Down browse accounts and pools. The active provider is marked `● active`.
+- Enter uses the selected provider immediately, keeping the current model when available, otherwise selecting its first model. There is no second "Use" menu.
+- Click a row to select it and inspect its details without switching. Enter confirms.
+- `Ctrl+O` opens management (enable/disable, clear cooldown, remove). `Ctrl+L` chooses a model. Returning from either keeps the selected provider highlighted.
+- `Ctrl+R` refreshes the selected account's live usage. PageUp/PageDown scroll its details on short terminals. Escape cancels without switching.
+- `+ Add account` and `Restart broker` are navigable rows.
+
+These controls use `tui.select.*`, `app.accounts.manage`, `app.accounts.model`, and `app.accounts.refresh` in [keybindings.json](keybindings.md). Loading usage is cancelled on selection changes or close; late responses cannot replace another account's details.
+
+### Usage and session costs
+
+Claude and ChatGPT Codex subscriptions show each provider-reported quota window (for example `5-hour` or `7-day`) as a bold label, a solid bar filled to the used share with its percent used, and the time until reset with the reset time in your local timezone. API-key, API-credit, and other unsupported account kinds show an explicit unsupported reason. Missing quota data or a failed provider request is unavailable, never 0% used. Clear cooldown only resets broker routing state; it does not reset your subscription allowance.
+
+Provider-reported credits are separate from session cost estimates. Claude extra-usage values retain the provider's credit units; Codex credit balances retain provider credits. They are not converted into subscription charges.
+
+The panel sums the current session's recorded assistant-message costs for the selected pinned account: input, output, cache read, cache write, and total. These dollar values are **API-rate estimates, not billed subscription charges**, and do not measure subscription quota. Missing catalog prices can produce zero recorded estimates; this does not imply free usage. The figures cover recorded assistant responses in this session, including its branches, not all-time usage or background requests.
+
+Pool responses are shown separately as **unattributed pool totals**, excluded from every individual account total. The footer's last-serving-account header does not reliably identify each persisted session response, so it is not used to assign pool costs to an account.
 
 An account can be named by part of its label, email or id. If exactly one account matches, the command uses it. If several match, Pi shows a list to choose from. Without interactive prompts, name the account exactly.
 

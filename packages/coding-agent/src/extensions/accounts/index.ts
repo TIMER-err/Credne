@@ -10,7 +10,6 @@ import {
 	type AccountCommandDeps,
 	ADD_ARGUMENTS,
 	runAccountCommand,
-	showAccounts,
 	showModels,
 } from "./commands.ts";
 import { AccountRegistry } from "./registry.ts";
@@ -86,11 +85,6 @@ export default function accountsExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.registerCommand("accounts", {
-		description: "List and manage provider accounts",
-		handler: (_args, ctx) => withErrors(ctx, () => showAccounts(deps, ctx)),
-	});
-
-	pi.registerCommand("account", {
 		description: "Account for this session: status, list, switch, default, add, remove, enable, disable, reset",
 		getArgumentCompletions: (prefix: string): AutocompleteItem[] | null => {
 			const [subcommand, ...rest] = prefix.split(/\s+/);

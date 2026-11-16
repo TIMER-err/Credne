@@ -137,6 +137,55 @@ export function createCustomMessage(
 	};
 }
 
+/** Exclude failed exchanges from model context without changing the saved transcript. */
+export function filterFailedMessages(messages: AgentMessage[]): AgentMessage[] {
+	return messages.flatMap(createFailureFilter(messages));
+}
+
+/** Create a filter that pairs failures across the complete context before selecting entries. */
+export function createFailureFilter(messages: AgentMessage[]): (message: AgentMessage) => AgentMessage[] {
+	const omittedCalls = new Set<string>();
+	for (const message of messages) {
+		if (message.role === "toolResult" && message.isError) omittedCalls.add(message.toolCallId);
+		if (message.role === "assistant" && (message.stopReason === "error" || message.stopReason === "aborted")) {
+			for (const part of message.content) {
+				if (part.type === "toolCall") omittedCalls.add(part.id);
+			}
+		}
+	}
+	return (message): AgentMessage[] => {
+		if (message.role === "assistant") {
+			if (message.stopReason === "error" || message.stopReason === "aborted") return [];
+			const content = message.content.filter((part) => part.type !== "toolCall" || !omittedCalls.has(part.id));
+			if (content.length === message.content.length) return [message];
+			return content.some((part) => part.type !== "thinking") ? [{ ...message, content }] : [];
+		}
+		if (message.role === "toolResult" && omittedCalls.has(message.toolCallId)) return [];
+		if (
+			message.role === "bashExecution" &&
+			(message.cancelled || (message.exitCode !== undefined && message.exitCode !== 0))
+		)
+			return [];
+		if (
+			message.role === "custom" &&
+			(message.customType === "subagent-result" || message.customType === "planning-result")
+		) {
+			const details = message.details;
+			if (details && typeof details === "object" && "result" in details) {
+				const result = details.result;
+				if (
+					result &&
+					typeof result === "object" &&
+					"status" in result &&
+					(result.status === "failed" || result.status === "aborted")
+				)
+					return [];
+			}
+		}
+		return [message];
+	};
+}
+
 /**
  * Transform AgentMessages (including custom types) to LLM-compatible Messages.
  *
@@ -146,7 +195,7 @@ export function createCustomMessage(
  * - Custom extensions and tools
  */
 export function convertToLlm(messages: AgentMessage[]): Message[] {
-	return messages
+	return filterFailedMessages(messages)
 		.map((m): Message | undefined => {
 			switch (m.role) {
 				case "bashExecution":

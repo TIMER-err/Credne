@@ -32,6 +32,10 @@ export const isBundledNode = typeof PI_BUNDLED_NODE !== "undefined" && PI_BUNDLE
 // Install Method Detection
 // =============================================================================
 
+export const CREDNE_REPO_URL = "https://github.com/neilhuang007/Credne";
+export const CREDNE_RELEASES_URL = `${CREDNE_REPO_URL}/releases/latest`;
+export const CREDNE_RELEASES_API_URL = "https://api.github.com/repos/neilhuang007/Credne/releases/latest";
+
 export type InstallMethod = "bun-binary" | "npm" | "pnpm" | "yarn" | "bun" | "unknown";
 
 interface SelfUpdateCommandStep {
@@ -368,7 +372,7 @@ export function getSelfUpdateUnavailableInstruction(
 	const method = detectInstallMethod();
 	const target = normalizeSelfUpdatePackageTarget(updatePackageTarget);
 	if (method === "bun-binary") {
-		return `Download from: https://github.com/earendil-works/pi/releases/latest`;
+		return `Download from: ${CREDNE_RELEASES_URL}`;
 	}
 	const command = getSelfUpdateCommandForMethod(method, packageName, target, npmCommand);
 	// Path-based detection also matches installs that only live under a package manager's directory,

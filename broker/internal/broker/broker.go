@@ -123,6 +123,12 @@ func Run(ctx context.Context, opts Options) error {
 		WithConfig(cfg).
 		WithConfigPath(runtimePath).
 		WithLocalManagementPassword(token).
+		WithHooks(cliproxy.Hooks{
+			OnConfigApplied: func(_ *cliproxy.Service, _ *config.Config) {
+				// Config reloads replace custom executors with generic OpenAI compatibility executors.
+				srv.registerAPIExecutors()
+			},
+		}).
 		WithServerOptions(
 			sdkapi.WithMiddleware(srv.gate.handle),
 			sdkapi.WithRouterConfigurator(srv.configure),
@@ -182,13 +188,13 @@ type server struct {
 func (s *server) configure(engine *gin.Engine, handler *handlers.BaseAPIHandler, _ *config.Config) {
 	s.engine = engine
 	s.handler = handler
-	handler.AuthManager.RegisterExecutor(s.apiAccounts.executor())
-	handler.AuthManager.RegisterExecutor(&openaiExecutor{baseURL: s.apiAccounts.openAIBaseURL, client: &http.Client{}})
+	s.registerAPIExecutors()
 	api := engine.Group(APIPrefix[:len(APIPrefix)-1])
 	api.GET("/health", s.health)
 	api.POST("/shutdown", s.shutdown)
 	api.GET("/accounts", s.listAccounts)
 	api.GET("/accounts/:key/models", s.accountModels)
+	api.GET("/accounts/:key/usage", s.accountUsage)
 	api.POST("/accounts/:key/disable", s.setDisabled(true))
 	api.POST("/accounts/:key/enable", s.setDisabled(false))
 	api.POST("/accounts/:key/reset", s.resetCooldown)
@@ -204,6 +210,12 @@ func (s *server) configure(engine *gin.Engine, handler *handlers.BaseAPIHandler,
 	api.POST("/route/:target/v1/messages", s.execute(protocolClaude))
 	api.POST("/route/:target/responses", s.execute(protocolOpenAIResponses))
 	api.POST("/route/:target/chat/completions", s.execute(protocolOpenAIChat))
+}
+
+// registerAPIExecutors binds broker-managed accounts to their official API handlers.
+func (s *server) registerAPIExecutors() {
+	s.handler.AuthManager.RegisterExecutor(s.apiAccounts.executor())
+	s.handler.AuthManager.RegisterExecutor(&openaiExecutor{baseURL: s.apiAccounts.openAIBaseURL, client: &http.Client{}})
 }
 
 func (s *server) health(c *gin.Context) {

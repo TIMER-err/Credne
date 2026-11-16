@@ -402,6 +402,32 @@ describe("TuiAltScreen", () => {
 		tui.stop();
 	});
 
+	it("sends leave to the component that handled the last move once the pointer moves off it", async () => {
+		const terminal = new VirtualTerminal(20, 2);
+		const tui = new TuiAltScreen(terminal);
+		const events: string[] = [];
+		const region = new MouseRegion(new Text("hover", 0, 0), (event) => {
+			if (event.type !== "move" && event.type !== "leave") return undefined;
+			events.push(event.type);
+			return { handled: true };
+		});
+		tui.setLayoutRoot(
+			new HStack([
+				{ component: region, basis: 10 },
+				{ component: new Text("plain", 0, 0), basis: 10 },
+			]),
+		);
+		tui.start();
+		await terminal.waitForRender();
+
+		terminal.sendInput("\x1b[<35;2;1M");
+		terminal.sendInput("\x1b[<35;3;1M");
+		terminal.sendInput("\x1b[<35;15;1M");
+		terminal.sendInput("\x1b[<35;16;1M");
+		assert.deepStrictEqual(events, ["move", "move", "leave"]);
+		tui.stop();
+	});
+
 	it("uses button-motion tracking inside terminal multiplexers", () => {
 		const environmentKeys = ["TMUX", "ZELLIJ", "STY", "TERM"] as const;
 		const previousEnvironment = new Map(environmentKeys.map((key) => [key, process.env[key]]));

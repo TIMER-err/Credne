@@ -4,6 +4,8 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionAPI } from "../src/core/extensions/types.ts";
+import type { ReadonlySessionManager } from "../src/core/session-manager.ts";
+import type { SubagentUsageSnapshot } from "../src/core/session-usage.ts";
 import { PrefixWarmup } from "../src/extensions/subagent/prefix-warmup.ts";
 import {
 	aggregateUsage,
@@ -69,6 +71,9 @@ interface FixtureScenario {
 	usage?: { input: number; cacheRead: number; cacheWrite: number }[];
 	warmBefore?: { input: number; cacheRead: number; cacheWrite: number; output: number; cost: number }[];
 	warmAfter?: { input: number; cacheRead: number; cacheWrite: number; output: number; cost: number }[];
+	warmDuringWait?: { input: number; cacheRead: number; cacheWrite: number; output: number; cost: number }[];
+	idleWarmAfter?: { input: number; cacheRead: number; cacheWrite: number; output: number; cost: number }[];
+	extraEntries?: Array<"toolResult" | "branch_summary" | "compaction" | "usage">;
 }
 
 interface LogEntry {
@@ -83,6 +88,7 @@ describe("subagent cache runtime", () => {
 	let tempDir: string;
 	let team: WorkerTeam;
 	let originalScript: string;
+	let snapshots: SubagentUsageSnapshot[];
 
 	const config: SubagentConfig = { name: "worker", source: "builtin", systemPrompt: "You are a worker." };
 
@@ -114,7 +120,14 @@ describe("subagent cache runtime", () => {
 
 	beforeEach(() => {
 		tempDir = mkdtempSync(join(tmpdir(), "pi-cache-runtime-"));
-		team = new WorkerTeam({ sendMessage: () => {} } as unknown as ExtensionAPI);
+		snapshots = [];
+		team = new WorkerTeam({
+			sendMessage: () => {},
+			appendEntry: (type: string, data: SubagentUsageSnapshot) => {
+				expect(type).toBe("subagent-usage");
+				snapshots.push(data);
+			},
+		} as unknown as ExtensionAPI);
 		originalScript = process.argv[1];
 		process.argv[1] = workerFixture;
 	});
@@ -151,6 +164,76 @@ describe("subagent cache runtime", () => {
 		await team.dispose();
 		process.argv[1] = originalScript;
 		rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	it("persists lifetime snapshots for two workers, later runs and idle cache refreshes", async () => {
+		const first = spawn({
+			usage: [{ input: 3, cacheRead: 2, cacheWrite: 0 }],
+			extraEntries: ["toolResult", "branch_summary", "compaction", "usage"],
+			idleWarmAfter: [{ input: 0, cacheRead: 4, cacheWrite: 0, output: 0, cost: 0.4 }],
+		});
+		const second = spawn({ usage: [{ input: 5, cacheRead: 0, cacheWrite: 0 }] });
+		await Promise.all([first.result, second.result]);
+		await vi.waitFor(() => expect(snapshots.findLast((entry) => entry.workerId === first.id)?.usage.cost).toBe(1.4));
+		expect(snapshots.findLast((entry) => entry.workerId === first.id)?.usage).toMatchObject({
+			input: 11,
+			output: 5,
+			cacheRead: 6,
+			cost: 1.4,
+		});
+		expect(snapshots.findLast((entry) => entry.workerId === second.id)?.usage.input).toBe(5);
+		expect(
+			await team.continue(
+				first.id,
+				JSON.stringify({ log: join(tempDir, "log.jsonl"), usage: [{ input: 7, cacheRead: 0, cacheWrite: 0 }] }),
+			),
+		).toBe("queued");
+		await vi.waitFor(() => expect(team.getViews().find((view) => view.id === first.id)?.runs).toHaveLength(2));
+		await vi.waitFor(() => expect(snapshots.findLast((entry) => entry.workerId === first.id)?.usage.input).toBe(18));
+		expect(snapshots.findLast((entry) => entry.workerId === first.id)?.usage.cost).toBe(1.4);
+	});
+
+	it("stops appending to a parent whose session ID changed", async () => {
+		await team.dispose();
+		let sessionId = "parent";
+		team = new WorkerTeam(
+			{
+				appendEntry: (_type: string, data: SubagentUsageSnapshot) => snapshots.push(data),
+			} as unknown as ExtensionAPI,
+			{ getSessionId: () => sessionId } as ReadonlySessionManager,
+		);
+		const releaseFile = join(tempDir, "release");
+		const worker = spawn({
+			releaseFile,
+			warmDuringWait: [{ input: 1, cacheRead: 0, cacheWrite: 0, output: 0, cost: 0.1 }],
+			usage: [{ input: 10, cacheRead: 0, cacheWrite: 0 }],
+		});
+		await vi.waitFor(() => expect(snapshots).toHaveLength(1));
+		sessionId = "successor";
+		writeFileSync(releaseFile, "");
+		expect((await worker.result).status).toBe("completed");
+		expect(snapshots).toHaveLength(1);
+	});
+
+	it("retains billed usage from failed and cancelled runs", async () => {
+		const failed = spawn({ fail: true, usage: [{ input: 8, cacheRead: 0, cacheWrite: 0 }] });
+		expect((await failed.result).status).toBe("failed");
+		expect(snapshots.findLast((entry) => entry.workerId === failed.id)?.usage.input).toBe(8);
+
+		const cancelled = spawn({
+			releaseFile: join(tempDir, "unreleased"),
+			warmDuringWait: [{ input: 4, cacheRead: 0, cacheWrite: 0, output: 2, cost: 0.3 }],
+		});
+		await vi.waitFor(() =>
+			expect(snapshots.findLast((entry) => entry.workerId === cancelled.id)?.usage.cost).toBe(0.3),
+		);
+		await team.cancel(cancelled.id);
+		expect((await cancelled.result).status).toBe("aborted");
+		expect(snapshots.findLast((entry) => entry.workerId === cancelled.id)?.usage).toMatchObject({
+			input: 4,
+			output: 2,
+			cost: 0.3,
+		});
 	});
 
 	it("waits through normalized start and releases siblings only at actual provider readiness", async () => {

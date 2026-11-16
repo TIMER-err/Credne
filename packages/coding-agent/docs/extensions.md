@@ -2934,6 +2934,18 @@ ctx.ui.setFooter(undefined);  // Restore built-in footer
 ctx.ui.setHeader((tui, theme) => new Text(theme.fg("accent", "my-project"), 0, 0));
 ctx.ui.setHeader(undefined);  // Restore built-in header
 
+// Show a view in place of the chat transcript (interactive mode only). Prompt submissions go to
+// onSubmit (slash commands still run in the main session), the prompt takes `color` (default accent)
+// with an `@label` badge and a `Message @label…` placeholder, and Escape in the prompt or
+// setMainView(undefined) returns to the transcript.
+ctx.ui.setMainView({
+  label: "build-log",
+  color: "success",
+  component: (tui, theme) => new Text(theme.fg("muted", "Waiting for output…"), 0, 0),
+  onSubmit: (text) => ctx.ui.notify(`Sent: ${text}`, "info"),
+});
+ctx.ui.setMainView(undefined);
+
 // Label shown for hidden thinking blocks
 ctx.ui.setHiddenThinkingLabel("Reasoning...");
 ctx.ui.setHiddenThinkingLabel();  // Restore default

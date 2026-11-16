@@ -10,6 +10,8 @@ import {
 import { allowNetwork } from "./test-network-env.ts";
 
 const originalSkipVersionCheck = process.env.PI_SKIP_VERSION_CHECK;
+const publishedRelease = (tag_name: string, extra: Record<string, unknown> = {}) =>
+	Response.json({ tag_name, draft: false, prerelease: false, published_at: "2026-05-01T00:00:00Z", ...extra });
 
 beforeEach(() => {
 	allowNetwork();
@@ -34,28 +36,62 @@ describe("version checks", () => {
 		expect(isNewerPackageVersion("0.70.6", "0.70.5")).toBe(true);
 	});
 
-	it("returns only newer versions", async () => {
-		const fetchMock = vi.fn(async () => Response.json({ version: "1.2.3" }));
+	it("returns only newer published versions", async () => {
+		const fetchMock = vi.fn(async () => publishedRelease("v1.2.3"));
 		vi.stubGlobal("fetch", fetchMock);
 
 		await expect(checkForNewPiVersion("1.2.3")).resolves.toBeUndefined();
 		await expect(checkForNewPiVersion("1.2.2")).resolves.toEqual({ version: "1.2.3" });
 	});
 
-	it("uses the pi.dev version check api with a pi user agent", async () => {
-		const fetchMock = vi.fn(async () => Response.json({ version: "1.2.4" }));
+	it("uses the Credne GitHub releases API with a pi user agent", async () => {
+		const fetchMock = vi.fn(async () => publishedRelease("v1.2.4"));
 		vi.stubGlobal("fetch", fetchMock);
 
 		await expect(getLatestPiVersion("1.2.3")).resolves.toBe("1.2.4");
 		expect(fetchMock).toHaveBeenCalledWith(
-			"https://pi.dev/api/latest-version",
+			"https://api.github.com/repos/neilhuang007/Credne/releases/latest",
 			expect.objectContaining({
 				headers: expect.objectContaining({
 					"User-Agent": expect.stringMatching(/^pi\/1\.2\.3 /),
-					accept: "application/json",
+					accept: "application/vnd.github+json",
 				}),
 			}),
 		);
+	});
+
+	it("rejects invalid, draft, prerelease, and unpublished release payloads", async () => {
+		for (const payload of [
+			{ tag_name: "not-semver", draft: false, prerelease: false, published_at: "now" },
+			{ tag_name: "v1.2.4", draft: true, prerelease: false, published_at: "now" },
+			{ tag_name: "v1.2.4-rc.1", draft: false, prerelease: true, published_at: "now" },
+			{ tag_name: "v1.2.4-rc.1", draft: false, prerelease: false, published_at: "now" },
+			{ tag_name: "v1.2.4+build.1", draft: false, prerelease: false, published_at: "now" },
+			{ tag_name: "v1.2.4", draft: false, prerelease: false },
+		]) {
+			vi.stubGlobal(
+				"fetch",
+				vi.fn(async () => Response.json(payload)),
+			);
+			await expect(getLatestPiRelease("1.2.3")).resolves.toBeUndefined();
+		}
+	});
+
+	it("does not check for releases offline", async () => {
+		const fetchMock = vi.fn();
+		vi.stubGlobal("fetch", fetchMock);
+		vi.stubEnv("PI_OFFLINE", "1");
+		await expect(getLatestPiRelease("1.2.3")).resolves.toBeUndefined();
+		expect(fetchMock).not.toHaveBeenCalled();
+		vi.unstubAllEnvs();
+	});
+
+	it("ignores a GitHub not-found response", async () => {
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () => new Response(null, { status: 404 })),
+		);
+		await expect(getLatestPiRelease("1.2.3")).resolves.toBeUndefined();
 	});
 
 	it("retries a transient version request when explicitly requested", async () => {
@@ -63,7 +99,7 @@ describe("version checks", () => {
 			.fn()
 			.mockRejectedValueOnce(new Error("fetch failed"))
 			.mockRejectedValueOnce(new Error("fetch failed"))
-			.mockResolvedValueOnce(Response.json({ version: "1.2.4" }));
+			.mockResolvedValueOnce(publishedRelease("v1.2.4"));
 		vi.stubGlobal("fetch", fetchMock);
 
 		await expect(getLatestPiRelease("1.2.3", { retry: true })).resolves.toEqual({ version: "1.2.4" });
@@ -89,25 +125,11 @@ describe("version checks", () => {
 		expect(formatVersionCheckError(error)).toBe("fetch failed (ETIMEDOUT, ENETUNREACH)");
 	});
 
-	it("returns the active package metadata from the version check api", async () => {
-		const fetchMock = vi.fn(async () =>
-			Response.json({
-				packageName: "@new-scope/pi",
-				version: "1.2.4",
-			}),
+	it("returns notes from GitHub release metadata", async () => {
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () => publishedRelease("v1.2.4", { body: " **Read this** " })),
 		);
-		vi.stubGlobal("fetch", fetchMock);
-
-		await expect(getLatestPiRelease("1.2.3")).resolves.toEqual({
-			packageName: "@new-scope/pi",
-			version: "1.2.4",
-		});
-	});
-
-	it("returns update notes from the version check api", async () => {
-		const fetchMock = vi.fn(async () => Response.json({ note: " **Read this** ", version: "1.2.4" }));
-		vi.stubGlobal("fetch", fetchMock);
-
 		await expect(getLatestPiRelease("1.2.3")).resolves.toEqual({ note: "**Read this**", version: "1.2.4" });
 	});
 
@@ -122,7 +144,7 @@ describe("version checks", () => {
 
 	it("allows direct api calls when automatic version checks are disabled", async () => {
 		process.env.PI_SKIP_VERSION_CHECK = "1";
-		const fetchMock = vi.fn(async () => Response.json({ version: "1.2.4" }));
+		const fetchMock = vi.fn(async () => publishedRelease("v1.2.4"));
 		vi.stubGlobal("fetch", fetchMock);
 
 		await expect(getLatestPiVersion("1.2.3")).resolves.toBe("1.2.4");

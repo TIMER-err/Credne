@@ -681,6 +681,16 @@ export class SettingsManager {
 		return this.settings.lastChangelogVersion;
 	}
 
+	getLastUpdateNotificationVersion(): string | undefined {
+		return this.settings.lastUpdateNotificationVersion;
+	}
+
+	setLastUpdateNotificationVersion(version: string): void {
+		this.globalSettings.lastUpdateNotificationVersion = version;
+		this.markModified("lastUpdateNotificationVersion");
+		this.save();
+	}
+
 	setLastChangelogVersion(version: string): void {
 		this.globalSettings.lastChangelogVersion = version;
 		this.markModified("lastChangelogVersion");

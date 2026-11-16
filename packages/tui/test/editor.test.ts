@@ -43,6 +43,18 @@ async function flushAutocomplete(): Promise<void> {
 }
 
 describe("Editor component", () => {
+	describe("Placeholder", () => {
+		it("shows the placeholder after the cursor only while empty, truncated to the width", () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+			editor.placeholder = "Message @explorer…";
+			const content = (width: number) => stripTerminalSequences(editor.render(width)[1]!);
+			assert.strictEqual(content(40).trimEnd(), " Message @explorer…");
+			for (const width of [5, 10, 40]) assert.strictEqual(visibleWidth(editor.render(width)[1]!), width);
+			editor.setText("hi");
+			assert.ok(!content(40).includes("Message"));
+		});
+	});
+
 	describe("Prompt history navigation", () => {
 		it("does nothing on Up arrow when history is empty", () => {
 			const editor = new Editor(createTestTUI(), defaultEditorTheme);

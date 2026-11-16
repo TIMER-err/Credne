@@ -45,9 +45,9 @@ function model<T extends Api>(api: T, provider = "test"): Model<T> {
 	};
 }
 
-function worker(selected: Model<Api>, options: { cwd?: string; effort?: string } = {}) {
+function worker(selected: Model<Api>, options: { cwd?: string; effort?: string; name?: string } = {}) {
 	vi.stubEnv("PI_SUBAGENT_WORKER_ID", "worker");
-	vi.stubEnv("PI_SUBAGENT_AGENT_NAME", "worker");
+	vi.stubEnv("PI_SUBAGENT_AGENT_NAME", options.name ?? "worker");
 	const hooks = new Map<string, Hook>();
 	const requests: WorkerRequest[] = [];
 	const ctx = {
@@ -265,10 +265,15 @@ describe("worker Anthropic cache payloads", () => {
 
 describe("worker OpenAI cache payloads", () => {
 	it.each(["openai-responses", "openai-codex-responses", "azure-openai-responses"] as const)(
-		"shares the key in serialized %s requests and leaves session headers separate",
+		"shares the system key across tasks and checkpoints in %s while keeping session headers separate",
 		async (api) => {
 			const keys: Array<string | undefined> = [];
-			for (const sessionId of ["worker-one", "worker-two"]) {
+			for (const [sessionId, conversation] of [
+				["worker-one", reference],
+				["worker-two", reference],
+				["worker-later", `${reference} Later checkpoint.`],
+				["worker-fresh", ""],
+			]) {
 				const selected = model(api);
 				const child = worker(selected);
 				const wire = transport(api);
@@ -283,16 +288,20 @@ describe("worker OpenAI cache payloads", () => {
 				};
 				const result =
 					api === "openai-responses"
-						? await openaiStream(selected as Model<"openai-responses">, context(sessionId), options).result()
+						? await openaiStream(
+								selected as Model<"openai-responses">,
+								context(sessionId, conversation),
+								options,
+							).result()
 						: api === "azure-openai-responses"
 							? await azureStream(
 									selected as Model<"azure-openai-responses">,
-									context(sessionId),
+									context(sessionId, conversation),
 									options,
 								).result()
 							: await codexStream(
 									selected as Model<"openai-codex-responses">,
-									context(sessionId),
+									context(sessionId, conversation),
 									options,
 								).result();
 				expect(result.stopReason, result.errorMessage).toBe("stop");
@@ -301,7 +310,7 @@ describe("worker OpenAI cache payloads", () => {
 				expect(result.usage).toMatchObject({ input: 10, cacheRead: 90, cacheWrite: 0 });
 			}
 			expect(keys[0]).toMatch(/^subagent-[a-f0-9]{48}$/);
-			expect(keys[1]).toBe(keys[0]);
+			expect(new Set(keys).size).toBe(1);
 		},
 	);
 
@@ -353,14 +362,26 @@ describe("worker cache admission identity and readiness", () => {
 		const first = worker(model("openai-responses"));
 		const second = worker(model("openai-responses"));
 		const third = worker(model("openai-responses"));
-		await first.payload(payload("one"));
-		await second.payload({ ...payload("two"), prompt_cache_key: "different-session" });
-		await third.payload(payload("three", `${reference} extra`));
+		const firstPayload = await first.payload(payload("one"));
+		const secondPayload = await second.payload({ ...payload("two"), prompt_cache_key: "different-session" });
+		const thirdPayload = await third.payload(payload("three", `${reference} extra`));
+		expect(firstPayload).toEqual({ ...payload("one"), prompt_cache_key: expect.stringMatching(/^subagent-/) });
+		const routingKey = (firstPayload as { prompt_cache_key: string }).prompt_cache_key;
+		expect(secondPayload).toEqual({ ...payload("two"), prompt_cache_key: routingKey });
+		expect(thirdPayload).toEqual({ ...payload("three", `${reference} extra`), prompt_cache_key: routingKey });
 		expect(first.requests[0]).toEqual(second.requests[0]);
 		expect(third.requests[0]).toMatchObject({
 			sharedKey: "sharedKey" in first.requests[0] ? first.requests[0].sharedKey : undefined,
 		});
 		expect(third.requests[0]).not.toEqual(first.requests[0]);
+	});
+
+	it("shares identical prefixes across profile aliases", async () => {
+		const first = worker(model("openai-responses"), { name: "worker" });
+		const firstPayload = await first.payload(payload());
+		const second = worker(model("openai-responses"), { name: "custom-worker" });
+		expect(await second.payload(payload())).toEqual(firstPayload);
+		expect(second.requests).toEqual(first.requests);
 	});
 
 	it.each(["provider", "model", "effort", "cwd", "tools", "system"])("separates a changed %s", async (field) => {

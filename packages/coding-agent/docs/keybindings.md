@@ -138,12 +138,23 @@ On native Windows, `app.suspend` has no default because Windows terminals do not
 | `app.session.tree` | None | Open session tree navigator (`/tree`) |
 | `app.session.fork` | None | Fork current session (`/fork`) |
 | `app.session.resume` | None | Open session resume picker (`/resume`) |
+| `app.subagents.select` | `down` | Focus the agent list below an empty editor when autocomplete is closed; Up/Down navigate rows (`/subagents` opens the separate session picker) |
 | `app.session.togglePath` | `ctrl+p` | Toggle path display |
 | `app.session.toggleSort` | `ctrl+s` | Toggle sort mode |
 | `app.session.toggleNamedFilter` | `ctrl+n` | Toggle named-only filter |
 | `app.session.rename` | `ctrl+r` | Rename session |
 | `app.session.delete` | `ctrl+d` | Delete session |
 | `app.session.deleteNoninvasive` | `ctrl+backspace` | Delete session when query is empty |
+
+### Accounts panel
+
+These actions apply inside `/accounts`. Up/Down browse providers, Enter uses the selected provider, Escape closes, and PageUp/PageDown scroll account details through the configurable `tui.select.*` actions.
+
+| Keybinding id | Default | Description |
+|---|---|---|
+| `app.accounts.manage` | `ctrl+o` | Manage the selected account |
+| `app.accounts.model` | `ctrl+l` | Choose a model on the selected account or pool |
+| `app.accounts.refresh` | `ctrl+r` | Refresh selected account usage |
 
 ### Models and Thinking
 

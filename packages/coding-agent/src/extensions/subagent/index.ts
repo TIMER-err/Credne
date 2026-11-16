@@ -38,10 +38,12 @@ import {
 	type SingleResult,
 	type SubagentDetails,
 } from "./runner.ts";
+import { type SessionPanelResult, SubagentSessionPanel } from "./session-panel.ts";
 import { getWorkerTeam, registerTeamTools } from "./team.ts";
 import { registerWorkerCache } from "./worker-cache.ts";
 import { connectWorkerChannel } from "./worker-channel.ts";
 import { registerWorkerPrompt, WORKER_FLAG } from "./worker-prompt.ts";
+import { showWorkerView } from "./worker-view.ts";
 
 const MAX_PARALLEL_TASKS = 8;
 const COLLAPSED_ITEM_COUNT = 10;
@@ -299,7 +301,7 @@ export default function (pi: ExtensionAPI) {
 	registerWorkerPrompt(pi);
 	registerWorkerCache(pi, requestParent);
 	pi.registerCommand("subagents", {
-		description: "List workers or cancel <id>|all",
+		description: "Open worker sessions, list them without a UI, or cancel <id>|all",
 		handler: async (args, ctx) => {
 			const jobs = getWorkerTeam(pi, ctx);
 			const parts = args.trim().split(/\s+/);
@@ -311,6 +313,19 @@ export default function (pi: ExtensionAPI) {
 				}
 				const statuses = await Promise.all(ids.map(async (id) => `${id}: ${await jobs.cancel(id)}`));
 				ctx.ui.notify(statuses.join("\n"), "info");
+				return;
+			}
+			if (!args.trim() && ctx.mode === "tui") {
+				const choice = await ctx.ui.custom<SessionPanelResult>(
+					(tui, uiTheme, keybindings, done) => new SubagentSessionPanel(tui, uiTheme, keybindings, jobs, done),
+					{
+						overlay: true,
+						overlayOptions: { anchor: "center", width: "94%", maxHeight: "90%" },
+						blocked: { kind: "question", message: "View subagent sessions" },
+					},
+				);
+				if (choice.kind === "worker") showWorkerView(ctx.ui, jobs, choice.workerId);
+				else if (choice.kind === "main") ctx.ui.setMainView(undefined);
 				return;
 			}
 			ctx.ui.notify(
@@ -335,10 +350,10 @@ export default function (pi: ExtensionAPI) {
 		description: [
 			"Delegate tasks to specialized subagents with isolated context.",
 			"Bundled agents: explorer (read-only codebase search), worker (multi-step tasks), critic (review of finished changes), crazy (extremely hard problems and deep research). User and project definitions can override these names.",
+			"Explorer: choose a cheap, fast model at medium or high thinking effort to search and return information, not to reason about solutions. Worker: choose a capable middle-tier model, such as Sol or Opus 5.5, at xhigh effort to reason during implementation. Crazy: choose an expensive, highly capable model at xhigh or max effort and supply focused context and references so it can concentrate on the hard problem.",
 			"Use background: true for independent work while you continue, then receive each result automatically. Use foreground execution when your next step needs the result immediately.",
 			"Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
-			"Please use search_models({}) to discover the different models that are available.",
-			"Use search_models to find available models yourself, including smaller models such as Luna. Bare IDs and unique names default to the current serving account. Keep that account unless a different route is intended; another account requires an explicit provider/model ID.",
+			"Use search_models once when selecting a model; it defaults to five compact cost-ranked results. Reuse a result while the route is valid, and refresh after model/account changes or dispatch failure. Prefer economical models for bounded tasks, but price does not guarantee capability. Use the bare modelId portion of a result ID to stay on the current account; include its provider only when intentionally changing routes.",
 			"Choose model, reasoningEffort, and turn at the top level or per task or chain step. Explicit model overrides the agent profile. turn: 0 starts fresh with only the task, -1 also gives the subagent a copy of the conversation so far with tool outputs shortened, and a positive turn number gives that copy up to a checkpoint from get_subagent_context, including task completions or reviewed milestones. The copy is captured at submission. Use list_agents, send_agent_message, interrupt_agent, continue_agent, and steer_agent to coordinate workers by ID.",
 			`Default agent scope is "user" (from ${path.join(getAgentDir(), "agents")}).`,
 			`To enable project-local agents in ${CONFIG_DIR_NAME}/agents, set agentScope: "both" (or "project").`,

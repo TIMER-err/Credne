@@ -4,6 +4,8 @@ Pi runs in your terminal and works with files on your machine. To use it, you ne
 
 For native Windows setup, read [Windows Setup](windows.md). For Android, read [Termux Setup](termux.md).
 
+**Credne builds:** The pi.dev installers and `@earendil-works/pi-coding-agent` npm package below install upstream Pi, not Credne. Get Credne from [Credne releases](https://github.com/neilhuang007/Credne/releases/latest). Credne's automatic update check reads GitHub releases; `pi update --self` will not install upstream Pi as an update. To run a custom updater, configure `PI_SELF_UPDATE_COMMAND` or the global `selfUpdateCommand` setting.
+
 ## 1. Install Pi
 
 Install Pi with the installer on macOS, Linux, or Windows:

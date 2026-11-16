@@ -14,6 +14,7 @@ import {
 	createBranchSummaryMessage,
 	createCompactionSummaryMessage,
 	createCustomMessage,
+	filterFailedMessages,
 } from "../messages.ts";
 import {
 	type ContextEditEntry,
@@ -163,8 +164,6 @@ export function collectEntriesForBranchSummary(
 function getMessageFromEntry(entry: SessionEntry, edit?: ContextEditEntry): AgentMessage | undefined {
 	switch (entry.type) {
 		case "message":
-			// Skip tool results - context is in assistant's tool call
-			if (entry.message.role === "toolResult") return undefined;
 			return edit ? projectContextEntry(entry, edit)[0] : entry.message;
 
 		case "custom_message":
@@ -229,11 +228,15 @@ export function prepareBranchEntries(entries: SessionEntry[], tokenBudget: numbe
 		if (entry.type === "context_edit") edits.set(entry.targetId, entry);
 	}
 
-	// Second pass: walk from newest to oldest, adding messages until token budget
-	for (let i = entries.length - 1; i >= 0; i--) {
-		const entry = entries[i];
-		const message = getMessageFromEntry(entry, edits.get(entry.id));
-		if (!message) continue;
+	const contextMessages = filterFailedMessages(
+		entries.flatMap((entry) => {
+			const message = getMessageFromEntry(entry, edits.get(entry.id));
+			return message ? [message] : [];
+		}),
+	);
+	for (let index = contextMessages.length - 1; index >= 0; index--) {
+		const message = contextMessages[index];
+		if (message.role === "toolResult") continue;
 
 		// Extract file ops from assistant messages (tool calls)
 		extractFileOpsFromMessage(message, fileOps);
@@ -243,7 +246,7 @@ export function prepareBranchEntries(entries: SessionEntry[], tokenBudget: numbe
 		// Check budget before adding
 		if (tokenBudget > 0 && totalTokens + tokens > tokenBudget) {
 			// If this is a summary entry, try to fit it anyway as it's important context
-			if (entry.type === "compaction" || entry.type === "branch_summary") {
+			if (message.role === "compactionSummary" || message.role === "branchSummary") {
 				if (totalTokens < tokenBudget * 0.9) {
 					messages.unshift(message);
 					totalTokens += tokens;

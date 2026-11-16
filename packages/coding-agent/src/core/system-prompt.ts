@@ -3,8 +3,8 @@
  */
 
 import { getSystemMessageText } from "@earendil-works/pi-ai";
-import { getDocsPath, getExamplesPath, getReadmePath } from "../config.ts";
-import { formatSkillsForPrompt, type Skill } from "./skills.ts";
+import { MAIN_AGENT_PROMPT } from "./main-agent-prompt.ts";
+import type { Skill } from "./skills.ts";
 
 export interface BuildSystemPromptOptions {
 	/** Custom system prompt (replaces the default prefix). */
@@ -24,7 +24,7 @@ export interface BuildSystemPromptOptions {
 	toolGuidelines?: Record<string, string[]>;
 	/** Additional guideline bullets appended to the default system prompt rules. */
 	promptGuidelines?: string[];
-	/** Text appended from user configuration before project context, skills, and cwd. */
+	/** Text appended from user configuration before project context and cwd. */
 	appendSystemPrompt?: string;
 	/** Additional XML-wrapped prompt sections keyed by tag name. */
 	sections?: Record<string, string>;
@@ -32,7 +32,7 @@ export interface BuildSystemPromptOptions {
 	cwd: string;
 	/** Pre-loaded context files. */
 	contextFiles?: Array<{ path: string; content: string }>;
-	/** Pre-loaded skills. */
+	/** Loaded skill metadata for extensions; the main prompt does not list skills. */
 	skills?: Skill[];
 }
 
@@ -119,9 +119,7 @@ function buildRules(
 		for (const rule of toolGuidelines[name] ?? []) addRule(rule);
 	}
 	for (const rule of promptGuidelines) addRule(rule);
-	addRule("Be concise in your responses");
-	addRule("Show file paths clearly when working with files");
-	return rules.map((rule) => `- ${rule}`).join("\n");
+	return rules.map((rule) => `* ${rule}`).join("\n");
 }
 
 /** Build the ordered, independently replaceable sections of the structured system prompt. */
@@ -131,14 +129,12 @@ export function buildSystemPromptSections(input: BuildSystemPromptOptions): Syst
 		customPrompt,
 		selectedTools,
 		hiddenTools,
-		toolSnippets,
 		toolGuidelines,
 		promptGuidelines,
 		appendSystemPrompt,
 		sections: customSections,
 		cwd,
 		contextFiles,
-		skills,
 	} = options;
 
 	for (const name of Object.keys(customSections)) {
@@ -152,37 +148,20 @@ export function buildSystemPromptSections(input: BuildSystemPromptOptions): Syst
 	if (customPrompt) {
 		promptSections.preamble = customPrompt;
 	} else {
-		promptSections.preamble =
-			"You are a coding assistant running inside pi, a coding agent harness. Help users inspect files, run commands, and modify code.";
-		const visibleTools = declaredTools.filter((name) => !!toolSnippets[name]);
-		const tools =
-			visibleTools.length > 0 ? visibleTools.map((name) => `- ${name}: ${toolSnippets[name]}`).join("\n") : "(none)";
-		promptSections.tools = `${tools}\n\nAdditional tools may be available.`;
-		promptSections.rules = buildRules(declaredTools, toolGuidelines, promptGuidelines);
-		promptSections.docs = `Pi documentation (read only when the user asks about the harness itself, its SDK, extensions, themes, skills, or TUI):
-- Main documentation: ${getReadmePath()}
-- Additional docs: ${getDocsPath()}
-- Examples: ${getExamplesPath()} (extensions, custom tools, SDK)
-- When reading pi docs or examples, resolve docs/... under Additional docs and examples/... under Examples, not the current working directory
-- When asked about: extensions (docs/extensions.md, examples/extensions/), themes (docs/themes.md), skills (docs/skills.md), prompt templates (docs/prompt-templates.md), TUI components (docs/tui.md), keybindings (docs/keybindings.md), SDK integrations (docs/sdk.md), custom providers (docs/custom-provider.md), adding models (docs/models.md), packages (docs/packages.md), environment variables (docs/environment-variables.md), MCP servers (docs/mcp.md), codemode scripts and non-LLM models such as classifiers and image models (docs/codemode.md)
-- Before implementing harness changes, read the relevant docs and examples in full, following related cross-references.`;
+		promptSections.preamble = MAIN_AGENT_PROMPT.preamble;
+		promptSections.rules = `# Tool Guidelines\n\n${buildRules(declaredTools, toolGuidelines, promptGuidelines)}`;
+		if (declaredTools.includes("bash") || declaredTools.includes("powershell"))
+			promptSections.shell_commands = MAIN_AGENT_PROMPT.shell;
+		if (declaredTools.includes("enter_plan_mode")) promptSections.planning = MAIN_AGENT_PROMPT.planning;
+		if (declaredTools.includes("subagent")) promptSections.subagents = MAIN_AGENT_PROMPT.subagents;
 	}
 
 	if (appendSystemPrompt) promptSections.addendum = appendSystemPrompt;
-	if (contextFiles.length > 0) promptSections.project_context = renderProjectContext(contextFiles);
-	// A hidden reader is still reachable through another tool, so skills stay but the hint names no tool.
-	const readers = ["read", "bash"] as const;
-	const skillFileReadTool =
-		readers.find((tool) => declaredTools.includes(tool)) ??
-		(readers.some((tool) => selectedTools.includes(tool)) ? "indirect" : undefined);
-	if (skillFileReadTool && skills.length > 0) {
-		const skillsPrompt = formatSkillsForPrompt(skills, skillFileReadTool).trim();
-		if (skillsPrompt) promptSections.skills = skillsPrompt;
-	}
-	promptSections.cwd = cwd.replace(/\\/g, "/");
 	for (const [name, content] of Object.entries(customSections)) {
 		if (content) promptSections[name] = content;
 	}
+	if (contextFiles.length > 0) promptSections.project_context = renderProjectContext(contextFiles);
+	promptSections.cwd = cwd.replace(/\\/g, "/");
 
 	const sections: SystemPromptSections = { preamble: promptSections.preamble };
 	for (const [name, content] of Object.entries(promptSections)) {

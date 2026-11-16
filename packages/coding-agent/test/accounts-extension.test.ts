@@ -6,9 +6,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type AssistantMessage, createModels, type Model } from "@earendil-works/pi-ai";
 import { REASONING_SUMMARY_LABEL } from "@earendil-works/pi-ai/api/transform-messages";
+import { TuiMainScreen } from "@earendil-works/pi-tui";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { VirtualTerminal } from "../../tui/test/virtual-terminal.ts";
 import { createEventBus } from "../src/core/event-bus.ts";
 import { createExtensionRuntime, loadExtensionFromFactory } from "../src/core/extensions/loader.ts";
+import type { ExtensionCommandContext } from "../src/core/extensions/types.ts";
+import { KeybindingsManager } from "../src/core/keybindings.ts";
 import {
 	type AccountCatalog,
 	BROKER_PLACEHOLDER_URL,
@@ -19,6 +23,7 @@ import {
 import { type BrokerAccount, BrokerClient, type BrokerModel } from "../src/extensions/accounts/client.ts";
 import accountsExtension from "../src/extensions/accounts/index.ts";
 import { type AccountProviderSpec, createAccountProvider, providerSpecs } from "../src/extensions/accounts/provider.ts";
+import { initTheme, theme } from "../src/modes/interactive/theme/theme.ts";
 import { openBrowser } from "../src/utils/open-browser.ts";
 
 // Sign-in opens the browser; the tests only record the URL.
@@ -360,7 +365,7 @@ describe("accounts extension", () => {
 			runtime,
 			"builtin:accounts",
 		);
-		expect([...extension.commands.keys()].sort()).toEqual(["account", "accounts", "models"]);
+		expect([...extension.commands.keys()].sort()).toEqual(["accounts", "models"]);
 		expect(runtime.pendingNativeProviderRegistrations.map((entry) => entry.provider.id)).toEqual(
 			providerSpecs(testCatalog()).map((spec) => spec.id),
 		);
@@ -385,6 +390,87 @@ describe("accounts extension", () => {
 	});
 });
 
+describe("accounts panel command", () => {
+	async function runPanel(keys: string[][], manageChoice?: string) {
+		initTheme("dark");
+		const agentDir = tempDir();
+		vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+		const broker = await startFakeBroker({
+			home: join(agentDir, "accounts"),
+			respond: (request) => (request.path.endsWith("/disable") ? { status: 200, body: {} } : undefined),
+		});
+		writeCatalog(join(agentDir, "accounts", "catalog.json"), testCatalog());
+		const runtime = createExtensionRuntime();
+		const setModel = vi.fn(async () => true);
+		runtime.setModel = setModel;
+		const extension = await loadExtensionFromFactory(
+			accountsExtension,
+			process.cwd(),
+			createEventBus(),
+			runtime,
+			"builtin:accounts",
+		);
+		const panels: string[][] = [];
+		const select = vi.fn(async () => manageChoice);
+		const ctx = {
+			hasUI: true,
+			model: spec(ACCT_A).models[0],
+			modelRegistry: {
+				find: () => undefined,
+				refresh: async () => {},
+				getAll: () => providerSpecs(testCatalog()).flatMap((entry) => entry.models),
+			},
+			sessionManager: { getEntries: () => [] },
+			ui: {
+				select,
+				notify: vi.fn(),
+				custom: async (factory: Parameters<ExtensionCommandContext["ui"]["custom"]>[0]) => {
+					let result: unknown;
+					const component = await factory(
+						new TuiMainScreen(new VirtualTerminal()),
+						theme,
+						new KeybindingsManager(),
+						(value) => {
+							result = value;
+						},
+					);
+					panels.push(component.render(120));
+					for (const key of keys[panels.length - 1] ?? []) component.handleInput?.(key);
+					component.dispose?.();
+					return result;
+				},
+			},
+		};
+		await extension.commands.get("accounts")!.handler("", ctx as never);
+		return { setModel, select, panels, broker, notifications: ctx.ui.notify.mock.calls };
+	}
+
+	it("default opens a custom panel and Enter remembers the account and model for new sessions", async () => {
+		const result = await runPanel([["\x1b[B", "\r"]]);
+		expect(result.setModel).toHaveBeenCalledExactlyOnceWith(
+			expect.objectContaining({ provider: ACCT_B, id: claudeModel.id }),
+			{ persist: true },
+		);
+		expect(result.select).not.toHaveBeenCalled();
+	});
+
+	it("cancelling the default panel never switches provider", async () => {
+		const result = await runPanel([["\x1b[B", "\x1b"]]);
+		expect(result.setModel).not.toHaveBeenCalled();
+		expect(result.select).not.toHaveBeenCalled();
+	});
+
+	it("returns from management to the same selected account", async () => {
+		const result = await runPanel([["\x1b[B", "\x0f"], ["\x1b"]], "Disable");
+		expect(result.panels).toHaveLength(2);
+		expect(result.panels[1].some((line) => line.startsWith("\x1b[7m› Claude · b@example.com"))).toBe(true);
+		expect(
+			result.broker.requests.some((request) => request.path === `/credne/v1/accounts/${claudeB.key}/disable`),
+		).toBe(true);
+		expect(result.setModel).not.toHaveBeenCalled();
+	});
+});
+
 describe("broker client", () => {
 	it("discovers a running broker and parses accounts defensively", async () => {
 		const broker = await startFakeBroker();
@@ -392,6 +478,57 @@ describe("broker client", () => {
 		expect(await client.connectExisting()).toMatchObject({ url: broker.url, token: TOKEN });
 		expect((await client.listAccounts()).map((entry) => entry.id)).toEqual([claudeA.id, claudeB.id, codexC.id]);
 		expect(await client.accountModels(claudeA.key)).toEqual([claudeModel]);
+	});
+
+	it("parses normalized quota windows and credits without forwarding unknown provider fields", async () => {
+		const broker = await startFakeBroker({
+			respond: (request) =>
+				request.path.endsWith("/usage")
+					? {
+							status: 200,
+							body: {
+								status: "available",
+								windows: [
+									{ label: "5-hour", usedPercent: 0, resetAt: "2026-05-01T13:00:00Z", accessToken: "secret" },
+								],
+								credits: [{ label: "Credit balance", amount: 12.34, unit: "credits" }],
+								secret: "hidden",
+							},
+						}
+					: undefined,
+		});
+		expect(await clientFor(broker.home).accountUsage(claudeA.key)).toEqual({
+			status: "available",
+			windows: [{ label: "5-hour", usedPercent: 0, resetAt: "2026-05-01T13:00:00Z" }],
+			credits: [{ label: "Credit balance", amount: 12.34, unit: "credits", unlimited: false }],
+		});
+	});
+
+	it.each([
+		{},
+		{ status: "available", windows: [{ label: "5-hour" }], credits: [] },
+		{ status: "available", windows: [{ label: "5-hour", usedPercent: 101 }], credits: [] },
+		{ status: "available", windows: [{ label: "5-hour", usedPercent: 50, resetAt: "invalid" }], credits: [] },
+	])("rejects malformed quota responses instead of making up zero usage: %j", async (body) => {
+		const broker = await startFakeBroker({
+			respond: (request) => (request.path.endsWith("/usage") ? { status: 200, body } : undefined),
+		});
+		await expect(clientFor(broker.home).accountUsage(claudeA.key)).rejects.toThrow();
+	});
+
+	it.each(["unsupported", "unavailable"])("preserves %s with its reason and no windows", async (status) => {
+		const broker = await startFakeBroker({
+			respond: (request) =>
+				request.path.endsWith("/usage")
+					? { status: 200, body: { status, reason: "Provider did not report limits." } }
+					: undefined,
+		});
+		expect(await clientFor(broker.home).accountUsage(claudeA.key)).toEqual({
+			status,
+			reason: "Provider did not report limits.",
+			windows: [],
+			credits: [],
+		});
 	});
 
 	it("never sends the token to a non-loopback discovery URL", async () => {
@@ -554,7 +691,15 @@ describe("account add flow", () => {
 		"API credits (monthly credits of Max, Ultra, Team plans, Claude Console sign-in)",
 		"API key (Anthropic Console key)",
 	];
-	const addArguments = ["claude", "claude-subscription", "claude-api-credits", "claude-api-key", "chatgpt", "codex"];
+	const addArguments = [
+		"claude",
+		"claude-subscription",
+		"claude-api-credits",
+		"claude-api-key",
+		"chatgpt",
+		"openai-api-key",
+		"codex",
+	];
 
 	beforeEach(() => {
 		vi.mocked(openBrowser).mockClear();
@@ -586,7 +731,7 @@ describe("account add flow", () => {
 		respond?: FakeBrokerOptions["respond"];
 	}
 
-	/** Runs `/account <args>` through the registered command against a fake broker and a scripted UI. */
+	/** Runs `/accounts <args>` through the registered command against a fake broker and a scripted UI. */
 	async function runAccount(args: string, script: AddScript = {}) {
 		const agentDir = tempDir();
 		const broker = await startFakeBroker({ home: join(agentDir, "accounts"), respond: script.respond });
@@ -618,7 +763,7 @@ describe("account add flow", () => {
 				setStatus: () => {},
 			},
 		};
-		await extension.commands.get("account")!.handler(args, ctx as never);
+		await extension.commands.get("accounts")!.handler(args, ctx as never);
 		return { menus, inputs, notifications, requests: broker.requests };
 	}
 
@@ -657,12 +802,18 @@ describe("account add flow", () => {
 		]);
 	});
 
-	it("signs in to ChatGPT without a second menu", async () => {
+	it("offers ChatGPT API keys and subscription sign-in in the second menu", async () => {
 		const { menus, inputs, notifications, requests } = await runAccount("add", {
-			choices: ["ChatGPT account"],
+			choices: ["ChatGPT account", "Subscription (ChatGPT sign-in through Codex)"],
 			respond: loginRoutes({ status: "ok", account: codexC }),
 		});
-		expect(menus).toEqual([{ title: "Add account", options: ["Claude account", "ChatGPT account"] }]);
+		expect(menus).toEqual([
+			{ title: "Add account", options: ["Claude account", "ChatGPT account"] },
+			{
+				title: "Add ChatGPT account",
+				options: ["API key (OpenAI API credits)", "Subscription (ChatGPT sign-in through Codex)"],
+			},
+		]);
 		expect(loginRequest(requests)?.provider).toBe("codex");
 		expect(inputs).toEqual(["Waiting for ChatGPT Codex sign-in"]);
 		expect(openBrowser).toHaveBeenCalledWith("https://auth.example/start");
@@ -674,9 +825,8 @@ describe("account add flow", () => {
 
 	it.each([
 		{ argument: "claude-subscription", provider: "claude", added: claudeA },
-		{ argument: "chatgpt", provider: "codex", added: codexC },
 		{ argument: "codex", provider: "codex", added: codexC },
-	])("/account add $argument signs in to $provider without menus", async ({ argument, provider, added }) => {
+	])("/accounts add $argument signs in to $provider without menus", async ({ argument, provider, added }) => {
 		const { menus, requests } = await runAccount(`add ${argument}`, {
 			respond: loginRoutes({ status: "ok", account: added }),
 		});
@@ -684,13 +834,13 @@ describe("account add flow", () => {
 		expect(loginRequest(requests)?.provider).toBe(provider);
 	});
 
-	it("/account add claude opens the Claude menu directly", async () => {
+	it("/accounts add claude opens the Claude menu directly", async () => {
 		const { menus, requests } = await runAccount("add claude", { choices: [undefined] });
 		expect(menus).toEqual([{ title: "Add Claude account", options: claudeLabels }]);
 		expect(requests).toEqual([]);
 	});
 
-	it("/account add claude-api-credits asks for a name and skips the menus", async () => {
+	it("/accounts add claude-api-credits asks for a name and skips the menus", async () => {
 		const { menus, inputs, notifications, requests } = await runAccount("add claude-api-credits", {
 			answers: ["work"],
 			respond: loginRoutes({ status: "ok", account: claudeCredits }),
@@ -716,7 +866,7 @@ describe("account add flow", () => {
 	it("completes the add arguments instead of provider ids", async () => {
 		const extension = await loadAccountsExtension(tempDir());
 		const complete = async (prefix: string) =>
-			((await extension.commands.get("account")!.getArgumentCompletions!(prefix)) ?? []).map((item) => item.value);
+			((await extension.commands.get("accounts")!.getArgumentCompletions!(prefix)) ?? []).map((item) => item.value);
 		expect(await complete("add ")).toEqual(addArguments.map((entry) => `add ${entry}`));
 		expect(await complete("add claude-api")).toEqual(["add claude-api-credits", "add claude-api-key"]);
 		expect(await complete("add x")).toEqual([]);
