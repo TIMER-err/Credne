@@ -42,7 +42,8 @@ const toolNames = [
 	"checkpoint_context",
 ];
 const revisionSchema = Type.Integer({ minimum: 1, description: "Current plan revision returned by get_plan." });
-const taskIdsSchema = Type.Array(Type.String(), { minItems: 1, maxItems: 4, uniqueItems: true });
+// Codex rejects uniqueItems in tool declarations. Validate distinct IDs before changing worker state.
+const taskIdsSchema = Type.Array(Type.String(), { minItems: 1, maxItems: 4, description: "Distinct task IDs." });
 
 interface WorkerJob {
 	id: string;
@@ -566,6 +567,7 @@ export default function planningExtension(pi: ExtensionAPI): void {
 		executionMode: "sequential",
 		async execute(_id, args) {
 			requirePlan(args.revision);
+			if (new Set(args.taskIds).size !== args.taskIds.length) throw new Error("Cancel requires distinct task IDs");
 			const selected = args.taskIds.map((id) => {
 				const job = jobs.get(id);
 				const status = plan?.tasks.find((task) => task.spec.id === id)?.state.status;
