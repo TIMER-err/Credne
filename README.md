@@ -5,7 +5,8 @@ Credne is a Pi-based coding agent with account switching, planning, and subagent
 **Windows x64:** Run these commands in PowerShell or Command Prompt. The release includes the account broker and runtime dependencies; no source checkout or Go compiler is needed.
 
 ```shell
-npm.cmd install --global --ignore-scripts https://github.com/neilhuang007/Credne/releases/download/0.1.3/credne-0.1.3-windows-x64.tgz
+curl.exe -fL https://github.com/neilhuang007/Credne/releases/download/0.1.3/credne-0.1.3-windows-x64.tgz -o credne-0.1.3-windows-x64.tgz
+npm.cmd install --global --ignore-scripts .\credne-0.1.3-windows-x64.tgz
 credne.cmd --version
 credne.cmd
 ```

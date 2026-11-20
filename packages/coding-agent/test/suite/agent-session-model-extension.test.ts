@@ -9,6 +9,7 @@ import {
 import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
 import { createAgentSession } from "../../src/core/sdk.ts";
+import { SessionManager } from "../../src/core/session-manager.ts";
 import type { BuildSystemPromptOptions, ExtensionAPI } from "../../src/index.ts";
 import { createHarness, getAssistantTexts, type Harness } from "./harness.ts";
 
@@ -142,7 +143,7 @@ describe("AgentSession model and extension characterization", () => {
 		expect(harness.settingsManager.getDefaultThinkingLevel()).toBe("medium");
 	});
 
-	it("restores a session thinking preference after switching through limited models", async () => {
+	it("restores a session thinking preference across accounts and limited models", async () => {
 		const harness = await createHarness({
 			models: [
 				{ id: "extended", reasoning: true },
@@ -155,6 +156,13 @@ describe("AgentSession model and extension characterization", () => {
 		const { session, sessionManager, settingsManager } = harness;
 		const extended = harness.getModel();
 		extended.thinkingLevelMap = { max: "max" };
+		const otherProvider = `${extended.provider}-account`;
+		session.modelRuntime.registerProvider(otherProvider, {
+			api: extended.api,
+			baseUrl: extended.baseUrl,
+			apiKey: "faux-account-key",
+			models: [extended],
+		});
 		session.setThinkingLevel("max");
 
 		await session.setModel(harness.getModel("limited")!);
@@ -162,7 +170,8 @@ describe("AgentSession model and extension characterization", () => {
 		await session.setModel(harness.getModel("plain")!);
 		expect(session.thinkingLevel).toBe("off");
 		expect(sessionManager.buildSessionContext().thinkingLevel).toBe("max");
-		await session.setModel(extended, { persist: true });
+		await session.setModel(session.modelRuntime.getModel(otherProvider, extended.id)!, { persist: true });
+		expect(session.model?.provider).toBe(otherProvider);
 		expect(session.thinkingLevel).toBe("max");
 		expect(settingsManager.getDefaultThinkingLevel()).toBe("medium");
 
@@ -214,16 +223,18 @@ describe("AgentSession model and extension characterization", () => {
 		});
 		harnesses.push(harness);
 		const [scoped, plain] = harness.models;
+		const sessionManager = SessionManager.create(harness.tempDir, harness.tempDir);
+		const sessionFile = sessionManager.getSessionFile()!;
 		const options = {
-			model: scoped,
 			modelRuntime: harness.session.modelRuntime,
 			resourceLoader: harness.session.resourceLoader,
-			sessionManager: harness.sessionManager,
 			settingsManager: harness.settingsManager,
 			cwd: harness.tempDir,
 		};
 		const { session: first } = await createAgentSession({
 			...options,
+			model: scoped,
+			sessionManager,
 			scopedModels: [{ model: scoped, thinkingLevel: "low" }],
 		});
 		try {
@@ -234,8 +245,12 @@ describe("AgentSession model and extension characterization", () => {
 			first.dispose();
 		}
 
-		const { session: resumed } = await createAgentSession(options);
+		const { session: resumed } = await createAgentSession({
+			...options,
+			sessionManager: SessionManager.open(sessionFile),
+		});
 		try {
+			expect(resumed.model?.id).toBe(scoped.id);
 			expect(resumed.thinkingLevel).toBe("low");
 			await resumed.setModel(plain);
 			expect(resumed.thinkingLevel).toBe("high");
@@ -248,7 +263,10 @@ describe("AgentSession model and extension characterization", () => {
 			resumed.dispose();
 		}
 
-		const { session: afterManualChange } = await createAgentSession(options);
+		const { session: afterManualChange } = await createAgentSession({
+			...options,
+			sessionManager: SessionManager.open(sessionFile),
+		});
 		try {
 			expect(afterManualChange.thinkingLevel).toBe("low");
 			await afterManualChange.setModel(plain);
