@@ -32,9 +32,10 @@ function copy(from, to) {
 
 // Pi code and assets.
 copy(join(codingAgentDir, "dist"), join(credneDir, "dist"));
-for (const entry of ["docs", "examples", "README.md", "CHANGELOG.md"]) {
+for (const entry of ["docs", "examples", "CHANGELOG.md"]) {
 	copy(join(codingAgentDir, entry), join(credneDir, entry));
 }
+copy(join(credneDir, "RELEASE_NOTES.md"), join(credneDir, "README.md"));
 
 // Runtime dependencies the bundle leaves external, at the versions package.json pins.
 const manifest = JSON.parse(readFileSync(join(credneDir, "package.json"), "utf8"));

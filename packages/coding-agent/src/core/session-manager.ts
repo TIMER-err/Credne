@@ -69,6 +69,8 @@ export interface SessionMessageEntry extends SessionEntryBase {
 export interface ThinkingLevelChangeEntry extends SessionEntryBase {
 	type: "thinking_level_change";
 	thinkingLevel: string;
+	/** Requested level for the selected model, when different from the session preference. */
+	modelThinkingLevel?: string;
 }
 
 export interface ModelChangeEntry extends SessionEntryBase {
@@ -1232,13 +1234,14 @@ export class SessionManager {
 	}
 
 	/** Append a thinking level change as child of current leaf, then advance leaf. Returns entry id. */
-	appendThinkingLevelChange(thinkingLevel: string): string {
+	appendThinkingLevelChange(thinkingLevel: string, modelThinkingLevel?: string): string {
 		const entry: ThinkingLevelChangeEntry = {
 			type: "thinking_level_change",
 			id: generateId(this.byId),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
 			thinkingLevel,
+			...(modelThinkingLevel !== undefined ? { modelThinkingLevel } : {}),
 		};
 		this._appendEntry(entry);
 		return entry.id;

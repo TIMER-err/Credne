@@ -32,20 +32,19 @@ describe("issue #11451 thinking level after tree navigation", () => {
 		expect(sessionManager.buildSessionContext().thinkingLevel).toBe("low");
 	});
 
-	it("does not record a level that only differs from the branch by clamping", async () => {
+	it("does not record an already recorded preference when the model clamps it", async () => {
 		const harness = await createHarness({ models: [{ id: "faux-reasoning", reasoning: true }] });
 		harnesses.push(harness);
 		harness.setResponses([fauxAssistantMessage("one")]);
 		const { session, sessionManager } = harness;
 
-		session.setThinkingLevel("high");
-		// As after resuming a session that requested xhigh on a model without it: the session runs at high.
-		sessionManager.appendThinkingLevelChange("xhigh");
+		session.setThinkingLevel("xhigh");
+		expect(session.thinkingLevel).toBe("high");
 		await session.prompt("one");
 
 		const levels = sessionManager
 			.getBranch()
 			.flatMap((entry) => (entry.type === "thinking_level_change" ? [entry.thinkingLevel] : []));
-		expect(levels.at(-1)).toBe("xhigh");
+		expect(levels).toEqual(["xhigh"]);
 	});
 });

@@ -1244,6 +1244,7 @@ export class InteractiveMode {
 	 * Initializes the UI, shows warnings, processes initial messages, and starts the interactive loop.
 	 */
 	async run(): Promise<void> {
+		const startupSession = this.session;
 		await this.init();
 
 		if (!process.env.PI_OFFLINE) {
@@ -1322,6 +1323,15 @@ export class InteractiveMode {
 		}
 
 		void this.maybeWarnAboutAnthropicSubscriptionAuth();
+
+		if (
+			this.session === startupSession &&
+			!initialMessage &&
+			!initialMessages?.length &&
+			this.pendingUserInputs.length === 0
+		) {
+			void this.offerInterruptedRun();
+		}
 
 		// Process initial messages
 		if (initialMessage) {
@@ -3572,6 +3582,11 @@ export class InteractiveMode {
 				this.editor.setText("");
 				return;
 			}
+			if (text === "/continue") {
+				this.editor.setText("");
+				await this.continueInterruptedRun(this.session);
+				return;
+			}
 			if (text === "/resume") {
 				this.showSessionSelector();
 				this.editor.setText("");
@@ -3985,7 +4000,7 @@ export class InteractiveMode {
 				// Set up escape to abort retry
 				this.retryEscapeHandler = this.defaultEditor.onEscape;
 				this.defaultEditor.onEscape = () => {
-					this.session.abortRetry();
+					this.restoreQueuedMessagesToEditor({ abort: true });
 				};
 				this.showStatusIndicator(
 					new RetryStatusIndicator(this.ui, event.attempt, event.maxAttempts, event.delayMs),
@@ -5341,25 +5356,10 @@ export class InteractiveMode {
 						this.showStatus(`Cache warming: ${mode}`);
 					},
 					onModelThinkingLevelChange: (provider, modelId, level) => {
-						this.settingsManager.setModelThinkingLevel(provider, modelId, level);
-						// If the override is for the current model, apply it to the session too
-						const current = this.session.model;
-						if (current && current.provider === provider && current.id === modelId) {
-							this.session.setThinkingLevel(level);
-							this.footer.invalidate();
-							this.updateEditorBorderColor();
-						}
+						this.session.setModelThinkingLevel(provider, modelId, level);
 					},
 					onModelThinkingLevelRemove: (provider, modelId) => {
-						this.settingsManager.removeModelThinkingLevel(provider, modelId);
-						// If the override was for the current model, revert to global default
-						const current = this.session.model;
-						if (current && current.provider === provider && current.id === modelId) {
-							const globalDefault = this.settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL;
-							this.session.setThinkingLevel(globalDefault);
-							this.footer.invalidate();
-							this.updateEditorBorderColor();
-						}
+						this.session.setModelThinkingLevel(provider, modelId, undefined);
 					},
 					onThemeChange: (themeSetting) => {
 						this.settingsManager.setTheme(themeSetting);
@@ -6055,7 +6055,8 @@ export class InteractiveMode {
 						: SessionManager.listAll(this.sessionManager.getSessionDir(), onProgress, signal),
 				async (sessionPath) => {
 					done();
-					await this.handleResumeSession(sessionPath);
+					const result = await this.handleResumeSession(sessionPath);
+					if (!result.cancelled) void this.offerInterruptedRun();
 				},
 				() => {
 					done();
@@ -6080,6 +6081,40 @@ export class InteractiveMode {
 			);
 			return { component: selector, focus: selector };
 		});
+	}
+
+	private async offerInterruptedRun(): Promise<void> {
+		const session = this.session;
+		if (!session.canContinueInterruptedRun) return;
+		const leafId = session.sessionManager.getLeafId();
+		const resume = "Continue the unfinished turn";
+		const redirect = "Stop and give new instructions";
+		try {
+			const choice = await this.showExtensionSelector("The last turn did not finish. What would you like to do?", [
+				resume,
+				redirect,
+			]);
+			if (this.session !== session || session.sessionManager.getLeafId() !== leafId) return;
+			if (choice === resume) {
+				await this.continueInterruptedRun(session);
+			} else if (choice === redirect) {
+				session.dismissInterruptedRun();
+				this.showStatus("Turn stopped. Enter new instructions below.");
+			}
+		} catch (error) {
+			if (this.session === session) this.showError(error instanceof Error ? error.message : String(error));
+		}
+	}
+
+	private async continueInterruptedRun(session: AgentSession): Promise<void> {
+		try {
+			const result = await session.continueInterruptedRun();
+			if (this.session !== session) return;
+			if (result === "busy") this.showStatus("Wait for the current operation to finish before continuing");
+			if (result === "nothing-to-continue") this.showStatus("No interrupted or failed turn to continue");
+		} catch (error) {
+			if (this.session === session) this.showError(error instanceof Error ? error.message : String(error));
+		}
 	}
 
 	private async handleResumeSession(

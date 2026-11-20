@@ -1,3 +1,37 @@
+# Credne
+
+Credne is a Pi-based coding agent with account switching, planning, and subagents. Install [Node.js](https://nodejs.org/) 22.19 or newer first.
+
+**Windows x64:** Run these commands in PowerShell or Command Prompt. The release includes the account broker and runtime dependencies; no source checkout or Go compiler is needed.
+
+```shell
+npm.cmd install --global --ignore-scripts https://github.com/neilhuang007/Credne/releases/download/0.1.3/credne-0.1.3-windows-x64.tgz
+credne.cmd --version
+credne.cmd
+```
+
+For the default Bash tool and `!` shell commands, install [Git for Windows](https://git-scm.com/download/win) if you don't already have Bash.
+
+**macOS and Linux:** Build the tagged release with Git, Node.js and Go 1.26.10 or newer:
+
+```sh
+git clone --branch 0.1.3 --depth 1 https://github.com/neilhuang007/Credne.git
+cd Credne
+npm ci --ignore-scripts
+revision=$(node -p "require('./nix/model-catalog.json').revision")
+curl -fsSLo models.all.json "https://pi.dev/api/models/revisions/$revision?types=chat,image,classifier"
+node packages/ai/scripts/hydrate-model-catalog.ts models.all.json
+npm run build:offline
+node credne/scripts/build.mjs
+npm pack ./credne --ignore-scripts
+npm install --global --ignore-scripts ./neilhuang007-credne-0.1.3.tgz
+credne --version
+```
+
+Run `credne` in the directory you want to work on. Use `/accounts add` to connect an account. See the [0.1.3 release notes](https://github.com/neilhuang007/Credne/releases/tag/0.1.3) for changes.
+
+## About upstream Pi
+
 <p align="center">
   <a href="https://pi.dev">
     <img alt="pi logo" src="https://pi.dev/logo-auto.svg" width="128">
@@ -10,9 +44,7 @@
 
 > New issues and PRs from new contributors are auto-closed by default. Maintainers review auto-closed issues daily. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
-# Pi
-
-Pi is a minimal, extensible agent harness that you can make your own.
+Pi is the upstream agent harness on which Credne is based.
 
 Adapt Pi to your workflows, not the other way around. Customize Pi with [extensions](packages/coding-agent/docs/extensions.md), [skills](packages/coding-agent/docs/skills.md), [prompt templates](packages/coding-agent/docs/prompt-templates.md), and [themes](packages/coding-agent/docs/themes.md). Bundle them as [Pi packages](packages/coding-agent/docs/packages.md) and share via npm or git.
 
@@ -20,40 +52,7 @@ Pi ships with powerful defaults but skips features like sub-agents and plan mode
 
 Use Pi [interactively](packages/coding-agent/docs/usage.md), automate it in [print or JSON mode](packages/coding-agent/docs/cli.md), control it over [RPC](packages/coding-agent/docs/rpc.md), or build apps with the [Pi TypeScript SDK](packages/coding-agent/docs/sdk.md). See [OpenClaw](https://github.com/OpenClaw/OpenClaw) for a real-world integration.
 
-## Getting started
-
-Install the command-line interface:
-
-```bash
-curl -fsSL https://pi.dev/install.sh | sh
-```
-
-On Windows:
-
-```shell
-powershell -c "irm https://pi.dev/install.ps1 | iex"
-```
-
-The installer pins all dependencies and updates Pi with `pi update`. Alternatively, install directly with npm, which does not pin transitive dependencies:
-
-```bash
-npm install -g --ignore-scripts @earendil-works/pi-coding-agent
-```
-
-Pi requires Node.js 22.19 or newer. The macOS, Linux, and Windows installers can install it if needed. Pi does not require dependency lifecycle scripts for a normal npm installation.
-
-Start Pi in the directory where you want it to work:
-
-```bash
-cd /path/to/project
-pi
-```
-
-For a built-in AI provider, run `/login` inside Pi to connect a subscription or API key. Then give Pi a task.
-
-See the [documentation](https://pi.dev/docs/latest) for full setup and usage instructions, or [visit pi.dev](https://pi.dev) for demos.
-
-## Run with Nix
+## Run upstream Pi with Nix
 
 ```bash
 nix run github:earendil-works/pi/stable

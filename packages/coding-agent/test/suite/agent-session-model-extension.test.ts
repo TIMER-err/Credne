@@ -1,14 +1,14 @@
-import type { AgentTool, ThinkingLevel } from "@earendil-works/pi-agent-core";
+import type { AgentTool } from "@earendil-works/pi-agent-core";
 import {
 	fauxAssistantMessage,
 	fauxToolCall,
 	getCurrentSystemPrompt,
 	type JsonObject,
-	type Model,
 	type Usage,
 } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
+import { createAgentSession } from "../../src/core/sdk.ts";
 import type { BuildSystemPromptOptions, ExtensionAPI } from "../../src/index.ts";
 import { createHarness, getAssistantTexts, type Harness } from "./harness.ts";
 
@@ -102,8 +102,10 @@ describe("AgentSession model and extension characterization", () => {
 		});
 		harnesses.push(harness);
 
+		harness.session.setThinkingLevel("high");
 		await harness.session.cycleModel();
 		expect(harness.session.model?.id).toBe("faux-2");
+		expect(harness.session.thinkingLevel).toBe("high");
 		expect(harness.settingsManager.getDefaultModel()).toBe("faux-1");
 
 		harness.session.setThinkingLevel("off");
@@ -133,24 +135,142 @@ describe("AgentSession model and extension characterization", () => {
 		await harness.session.setModel(model2);
 		expect(harness.session.thinkingLevel).toBe("low");
 
-		// Switch back to faux-1 → no per-model override, uses global default
+		// The model's override does not replace the session preference.
 		const model1 = harness.getModel("faux-1")!;
 		await harness.session.setModel(model1);
-		expect(harness.session.thinkingLevel).toBe("medium");
+		expect(harness.session.thinkingLevel).toBe("high");
+		expect(harness.settingsManager.getDefaultThinkingLevel()).toBe("medium");
 	});
 
-	it("falls back to current session thinking level when no per-model or global default is configured", async () => {
+	it("restores a session thinking preference after switching through limited models", async () => {
 		const harness = await createHarness({
 			models: [
-				{ id: "faux-1", name: "One", reasoning: true },
-				{ id: "faux-2", name: "Two", reasoning: true },
+				{ id: "extended", reasoning: true },
+				{ id: "limited", reasoning: true },
+				{ id: "plain", reasoning: false },
 			],
+			settings: { defaultThinkingLevel: "medium" },
 		});
 		harnesses.push(harness);
+		const { session, sessionManager, settingsManager } = harness;
+		const extended = harness.getModel();
+		extended.thinkingLevelMap = { max: "max" };
+		session.setThinkingLevel("max");
 
-		harness.session.setThinkingLevel("high");
-		await harness.session.setModel(harness.getModel("faux-2")!);
-		expect(harness.session.thinkingLevel).toBe("high");
+		await session.setModel(harness.getModel("limited")!);
+		expect(session.thinkingLevel).toBe("high");
+		await session.setModel(harness.getModel("plain")!);
+		expect(session.thinkingLevel).toBe("off");
+		expect(sessionManager.buildSessionContext().thinkingLevel).toBe("max");
+		await session.setModel(extended, { persist: true });
+		expect(session.thinkingLevel).toBe("max");
+		expect(settingsManager.getDefaultThinkingLevel()).toBe("medium");
+
+		await session.setModel(harness.getModel("plain")!);
+		session.setThinkingLevel("off");
+		// A user's explicit change also wins when the effective level does not change.
+		expect(sessionManager.buildSessionContext().thinkingLevel).toBe("off");
+		await session.setModel(extended);
+		expect(session.thinkingLevel).toBe("off");
+	});
+
+	it("keeps the requested startup and resumed thinking levels when the selected model clamps them", async () => {
+		const harness = await createHarness({ models: [{ id: "first", reasoning: false }] });
+		harnesses.push(harness);
+		const model = harness.getModel();
+		const options = {
+			model,
+			modelRuntime: harness.session.modelRuntime,
+			resourceLoader: harness.session.resourceLoader,
+			sessionManager: harness.sessionManager,
+			settingsManager: harness.settingsManager,
+			cwd: harness.tempDir,
+		};
+		const { session: first } = await createAgentSession({ ...options, thinkingLevel: "max" });
+		try {
+			expect(first.thinkingLevel).toBe("off");
+			expect(first.sessionManager.buildSessionContext().thinkingLevel).toBe("max");
+			first.sessionManager.appendMessage({ role: "user", content: "resume", timestamp: Date.now() });
+		} finally {
+			first.dispose();
+		}
+		const { session: resumed } = await createAgentSession(options);
+		try {
+			expect(resumed.thinkingLevel).toBe("off");
+			await resumed.setModel({ ...model, id: "extended", reasoning: true, thinkingLevelMap: { max: "max" } });
+			expect(resumed.thinkingLevel).toBe("max");
+		} finally {
+			resumed.dispose();
+		}
+	});
+
+	it("restores a scoped override on resume without replacing the preference for other models", async () => {
+		const harness = await createHarness({
+			models: [
+				{ id: "scoped", reasoning: true },
+				{ id: "plain", reasoning: true },
+			],
+			settings: { defaultThinkingLevel: "high", modelThinkingLevels: { "faux/scoped": "medium" } },
+		});
+		harnesses.push(harness);
+		const [scoped, plain] = harness.models;
+		const options = {
+			model: scoped,
+			modelRuntime: harness.session.modelRuntime,
+			resourceLoader: harness.session.resourceLoader,
+			sessionManager: harness.sessionManager,
+			settingsManager: harness.settingsManager,
+			cwd: harness.tempDir,
+		};
+		const { session: first } = await createAgentSession({
+			...options,
+			scopedModels: [{ model: scoped, thinkingLevel: "low" }],
+		});
+		try {
+			expect(first.thinkingLevel).toBe("low");
+			expect(first.sessionManager.buildSessionContext().thinkingLevel).toBe("high");
+			first.sessionManager.appendMessage({ role: "user", content: "resume", timestamp: Date.now() });
+		} finally {
+			first.dispose();
+		}
+
+		const { session: resumed } = await createAgentSession(options);
+		try {
+			expect(resumed.thinkingLevel).toBe("low");
+			await resumed.setModel(plain);
+			expect(resumed.thinkingLevel).toBe("high");
+			await resumed.setModel(scoped);
+			expect(resumed.thinkingLevel).toBe("medium");
+			resumed.setThinkingLevel("low");
+			await resumed.setModel(scoped, { persist: true });
+			expect(resumed.thinkingLevel).toBe("low");
+		} finally {
+			resumed.dispose();
+		}
+
+		const { session: afterManualChange } = await createAgentSession(options);
+		try {
+			expect(afterManualChange.thinkingLevel).toBe("low");
+			await afterManualChange.setModel(plain);
+			expect(afterManualChange.thinkingLevel).toBe("low");
+		} finally {
+			afterManualChange.dispose();
+		}
+	});
+
+	it("editing the current model's settings applies only to that model", async () => {
+		const harness = await createHarness({ models: [{ id: "configured", reasoning: true }] });
+		harnesses.push(harness);
+		const { session, settingsManager } = harness;
+		const { provider, id } = harness.getModel();
+		session.setThinkingLevel("high");
+
+		session.setModelThinkingLevel(provider, id, "low");
+		expect(settingsManager.getModelThinkingLevel(provider, id)).toBe("low");
+		expect(session.thinkingLevel).toBe("low");
+		session.setModelThinkingLevel(provider, id, undefined);
+		expect(settingsManager.getModelThinkingLevel(provider, id)).toBeUndefined();
+		expect(session.thinkingLevel).toBe("high");
 	});
 
 	it("per-model override takes priority over global default during model switch", async () => {
@@ -172,29 +292,33 @@ describe("AgentSession model and extension characterization", () => {
 		expect(harness.session.thinkingLevel).toBe("minimal");
 	});
 
-	it("cycles through scoped models and preserves the scoped thinking preference", async () => {
+	it("inherits the session thinking level for unqualified scoped models but applies explicit suffixes", async () => {
 		const harness = await createHarness({
 			models: [
-				{ id: "faux-1", name: "One", reasoning: true },
-				{ id: "faux-2", name: "Two", reasoning: false },
+				{ id: "faux-1", reasoning: true },
+				{ id: "faux-2", reasoning: false },
+				{ id: "faux-3", reasoning: true },
 			],
+			settings: { defaultThinkingLevel: "medium", modelThinkingLevels: { "faux/faux-3": "minimal" } },
 		});
 		harnesses.push(harness);
-		const modelOne = harness.getModel("faux-1")!;
-		const modelTwo = harness.getModel("faux-2")!;
-		harness.session.setScopedModels([{ model: modelOne, thinkingLevel: "high" }, { model: modelTwo }] as Array<{
-			model: Model<string>;
-			thinkingLevel?: ThinkingLevel;
-		}>);
+		const [modelOne, modelTwo, modelThree] = harness.models;
+		harness.session.setScopedModels([
+			{ model: modelOne },
+			{ model: modelTwo },
+			{ model: modelThree, thinkingLevel: "low" },
+		]);
 		harness.session.setThinkingLevel("high");
 
-		await harness.session.cycleModel();
-		expect(harness.session.model?.id).toBe("faux-2");
-		expect(harness.session.thinkingLevel).toBe("off");
+		const clamped = await harness.session.cycleModel();
+		expect(clamped?.model.id).toBe("faux-2");
+		expect(clamped?.thinkingLevel).toBe("off");
+		expect((await harness.session.cycleModel("backward"))?.thinkingLevel).toBe("high");
 
-		await harness.session.cycleModel();
-		expect(harness.session.model?.id).toBe("faux-1");
-		expect(harness.session.thinkingLevel).toBe("high");
+		const explicit = await harness.session.cycleModel("backward");
+		expect(explicit?.model.id).toBe("faux-3");
+		expect(explicit?.thinkingLevel).toBe("low");
+		expect((await harness.session.cycleModel())?.thinkingLevel).toBe("high");
 	});
 
 	// Regression test for https://github.com/earendil-works/pi/issues/11806

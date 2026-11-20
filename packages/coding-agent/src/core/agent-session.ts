@@ -32,7 +32,13 @@ import {
 	type StreamFn,
 	type ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
-import { contentText, getCurrentSystemMessage, getCurrentTools, retryDelayMs } from "@earendil-works/pi-ai";
+import {
+	contentText,
+	getCurrentSystemMessage,
+	getCurrentTools,
+	getSystemMessageText,
+	retryDelayMs,
+} from "@earendil-works/pi-ai";
 import type {
 	AssistantMessage,
 	AuthResult,
@@ -79,7 +85,7 @@ import {
 	prepareCompaction,
 	shouldCompact,
 } from "./compaction/index.ts";
-import { DEFAULT_THINKING_LEVEL, THINKING_LEVEL_OPTIONS } from "./defaults.ts";
+import { THINKING_LEVEL_OPTIONS } from "./defaults.ts";
 import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.ts";
 import { createToolHtmlRenderer } from "./export-html/tool-renderer.ts";
 import {
@@ -268,6 +274,10 @@ export interface AgentSessionConfig {
 	sessionManager: SessionManager;
 	settingsManager: SettingsManager;
 	cwd: string;
+	/** Initial thinking preference before the active model's capabilities are applied. */
+	preferredThinkingLevel?: ThinkingLevel;
+	/** Initial model-specific thinking override, if different from the session preference. */
+	modelThinkingLevel?: ThinkingLevel;
 	/** Models to cycle through with Ctrl+P (from --models flag) */
 	scopedModels?: Array<{ model: Model<any>; thinkingLevel?: ThinkingLevel }>;
 	/** Resource loader for extensions, skills, prompts, themes, context files, and system prompt */
@@ -406,12 +416,17 @@ function getNextCycleIndex(
 	return direction === "forward" ? (currentIndex + 1) % length : (currentIndex - 1 + length) % length;
 }
 
+const INTERRUPTED_RUN_ENTRY = "core:interrupted-run";
+const DISMISSED_INTERRUPTED_RUN_ENTRY = "core:interrupted-run-dismissed";
+
 export class AgentSession {
 	readonly agent: Agent;
 	readonly sessionManager: SessionManager;
 	readonly settingsManager: SettingsManager;
 
 	private _scopedModels: Array<{ model: Model<any>; thinkingLevel?: ThinkingLevel }>;
+	private _preferredThinkingLevel: ThinkingLevel;
+	private _modelThinkingLevel: ThinkingLevel | undefined;
 
 	// Event subscription state
 	private _unsubscribeAgent?: () => void;
@@ -419,6 +434,11 @@ export class AgentSession {
 	private _isAgentRunActive = false;
 	private _promptPreflightCount = 0;
 	private _agentRunAbortRequested = false;
+	private _interruptedRun?: {
+		sessionId: string;
+		entryId: string;
+		promptOptions: NormalizedBuildSystemPromptOptions;
+	};
 	private _idleWaitPromise: Promise<void> | undefined;
 	private _resolveIdleWait: (() => void) | undefined;
 
@@ -516,11 +536,15 @@ export class AgentSession {
 	private _baseSystemPromptOptions!: NormalizedBuildSystemPromptOptions;
 	/** Prompt options after before_agent_start mutations for the active run. */
 	private _runSystemPromptOptions?: NormalizedBuildSystemPromptOptions;
+	/** A reopened run uses the prompt recorded in its transcript, not reconstructed extension options. */
+	private _recordedRunSystemPrompt?: string;
 
 	constructor(config: AgentSessionConfig) {
 		this.agent = config.agent;
 		this.sessionManager = config.sessionManager;
 		this.settingsManager = config.settingsManager;
+		this._preferredThinkingLevel = config.preferredThinkingLevel ?? this.agent.state.thinkingLevel;
+		this._modelThinkingLevel = config.modelThinkingLevel;
 		this._scopedModels = config.scopedModels ?? [];
 		this._resourceLoader = config.resourceLoader;
 		this._customTools = config.customTools ?? [];
@@ -681,22 +705,16 @@ export class AgentSession {
 		this.sessionManager.appendModelChange(model.provider, model.id);
 	}
 
-	/**
-	 * Record the thinking level on the current branch when the branch implies another one (#11451).
-	 * Tree navigation can leave the latest `thinking_level_change` on another branch. The recorded
-	 * level is compared after clamping to the current model, so a level clamped on resume (e.g.
-	 * `xhigh` running as `high`) is not recorded over the requested one.
-	 */
+	/** Record unclamped thinking preferences when tree navigation left them on another branch (#11451). */
 	private _recordThinkingLevel(branch: SessionEntry[]): void {
 		const recorded = branch.findLast((entry) => entry.type === "thinking_level_change");
-		if (!recorded) return;
-		const recordedLevel = recorded.thinkingLevel as ThinkingLevel;
-		const availableLevels = this.getAvailableThinkingLevels();
-		const effective = availableLevels.includes(recordedLevel)
-			? recordedLevel
-			: this._clampThinkingLevel(recordedLevel, availableLevels);
-		if (effective === this.thinkingLevel) return;
-		this.sessionManager.appendThinkingLevelChange(this.thinkingLevel);
+		if (
+			recorded?.thinkingLevel === this._preferredThinkingLevel &&
+			recorded.modelThinkingLevel === this._modelThinkingLevel
+		) {
+			return;
+		}
+		this.sessionManager.appendThinkingLevelChange(this._preferredThinkingLevel, this._modelThinkingLevel);
 	}
 
 	/** The model whose limits apply to the conversation. */
@@ -968,16 +986,19 @@ export class AgentSession {
 			const context = await this._compactBeforeNextAssistantResponse(turn.context);
 			const previousSnapshot = await previousPrepareNextTurnWithContext?.({ ...turn, context }, signal);
 			const nextContext = previousSnapshot?.context ?? context;
-			const runOptions = this._runSystemPromptOptions ?? this._baseSystemPromptOptions;
-			const options = normalizeBuildSystemPromptOptions({
-				...runOptions,
-				selectedTools: this.getActiveToolNames(),
-				toolSnippets: { ...this._baseSystemPromptOptions.toolSnippets, ...runOptions.toolSnippets },
-				toolGuidelines: { ...this._baseSystemPromptOptions.toolGuidelines, ...runOptions.toolGuidelines },
-			});
-			const updateMessage = this._preparePromptAndToolLoadout(options, nextContext.messages);
-			// Keep session.systemPrompt and ctx.getSystemPrompt() in step with what the provider sees.
-			this._runSystemPromptOptions = options;
+			let updateMessage: SystemMessage | undefined;
+			if (this._recordedRunSystemPrompt === undefined) {
+				const runOptions = this._runSystemPromptOptions ?? this._baseSystemPromptOptions;
+				const options = normalizeBuildSystemPromptOptions({
+					...runOptions,
+					selectedTools: this.getActiveToolNames(),
+					toolSnippets: { ...this._baseSystemPromptOptions.toolSnippets, ...runOptions.toolSnippets },
+					toolGuidelines: { ...this._baseSystemPromptOptions.toolGuidelines, ...runOptions.toolGuidelines },
+				});
+				updateMessage = this._preparePromptAndToolLoadout(options, nextContext.messages);
+				// Keep session.systemPrompt and ctx.getSystemPrompt() in step with what the provider sees.
+				this._runSystemPromptOptions = options;
+			}
 
 			return {
 				...previousSnapshot,
@@ -1477,6 +1498,7 @@ export class AgentSession {
 	 * Call this when completely done with the session.
 	 */
 	dispose(): void {
+		this._interruptedRun = undefined;
 		try {
 			this.abortRetry();
 			this.abortCompaction();
@@ -1529,7 +1551,7 @@ export class AgentSession {
 		return this.agent.state.model;
 	}
 
-	/** Current thinking level */
+	/** Effective thinking level for the current model. */
 	get thinkingLevel(): ThinkingLevel {
 		return this.agent.state.thinkingLevel;
 	}
@@ -1554,7 +1576,10 @@ export class AgentSession {
 
 	/** Current effective system prompt, including changes not yet sent to the model. */
 	get systemPrompt(): string {
-		return buildSystemPrompt(this._runSystemPromptOptions ?? this._baseSystemPromptOptions);
+		return (
+			this._recordedRunSystemPrompt ??
+			buildSystemPrompt(this._runSystemPromptOptions ?? this._baseSystemPromptOptions)
+		);
 	}
 
 	/** Current retry attempt (0 if not retrying) */
@@ -1954,13 +1979,18 @@ export class AgentSession {
 	 * @param onStarted Called once the run's messages are prepared, before the first request.
 	 */
 	private async _startRun(trigger: BeforeAgentStartTrigger, onStarted?: () => void): Promise<void> {
-		this._isAgentRunActive = true;
-		this._agentRunAbortRequested = false;
+		this._beginAgentRun();
 		let messages: AgentMessage[];
 		try {
 			messages = await this._prepareRun(trigger);
+			// A custom run's trigger looks like a context-only entry. Unlike a new user
+			// message, it needs an explicit boundary to supersede an earlier interruption.
+			if (trigger.messageType === "custom" && this._findInterruptedRun()) {
+				this.sessionManager.appendCustomEntry(DISMISSED_INTERRUPTED_RUN_ENTRY);
+			}
 		} catch (error) {
 			this._isAgentRunActive = false;
+			this._runSystemPromptOptions = undefined;
 			this._flushPendingBashMessages();
 			this._flushPendingCustomMessages();
 			this._resolveIdleWaitIfIdle();
@@ -1978,26 +2008,69 @@ export class AgentSession {
 		// The run records the loadout in the transcript; restored tools that did not register by now
 		// are dropped, so a tool that never registers does not stay pending.
 		this._pendingToolNames.clear();
+		await this._runAgent(() => this.agent.prompt(messages));
+	}
+
+	private _beginAgentRun(): void {
+		this._isAgentRunActive = true;
+		this._agentRunAbortRequested = false;
+		this._interruptedRun = undefined;
+	}
+
+	private async _runAgent(start: () => Promise<void>): Promise<void> {
 		try {
-			await this.agent.prompt(messages);
+			await start();
 			while (!this._agentRunAbortRequested) {
 				if (await this._handlePostAgentRun()) {
 					if (this._agentRunAbortRequested) break;
-					await this.agent.continue();
+					await this._continueAgent();
 					continue;
 				}
 				if (this._agentRunAbortRequested || !(await this._runBeforeSettleBoundary())) break;
 				if (this._agentRunAbortRequested) break;
-				await this.agent.continue();
+				await this._continueAgent();
 			}
 		} finally {
-			if (this._agentRunAbortRequested) this._finishCancelledRetry();
-			this._failedResponse = undefined;
-			this._runSystemPromptOptions = undefined;
-			this._flushPendingBashMessages();
-			this._flushPendingCustomMessages();
-			await this._emitAgentSettled();
+			try {
+				if (this._agentRunAbortRequested) this._finishCancelledRetry();
+				this._failedResponse = undefined;
+				this._lastAssistantMessage = undefined;
+				this._flushPendingBashMessages();
+				this._flushPendingCustomMessages();
+				// Aborting during tools can leave results without an aborted assistant response.
+				const entryId =
+					this._agentRunAbortRequested && this._hasInterruptedRunContext()
+						? this.sessionManager.appendCustomEntry(INTERRUPTED_RUN_ENTRY)
+						: this._findInterruptedRun()?.id;
+				if (entryId && this._runSystemPromptOptions) {
+					this._interruptedRun = {
+						sessionId: this.sessionId,
+						entryId,
+						promptOptions: this._runSystemPromptOptions,
+					};
+				}
+			} finally {
+				this._runSystemPromptOptions = undefined;
+				this._recordedRunSystemPrompt = undefined;
+				await this._emitAgentSettled();
+			}
 		}
+	}
+
+	private async _continueAgent(): Promise<void> {
+		const last = this.messages.at(-1);
+		if (
+			last?.role === "assistant" &&
+			(last.stopReason === "error" || last.stopReason === "aborted") &&
+			(this._failedResponse || !this.agent.hasQueuedMessages()) &&
+			this._hasInterruptedRunContext()
+		) {
+			// A retry or boundary continuation may still have a rejected attempt in raw history.
+			// Use the provider projection; ordinary queued prompts still use Agent.continue().
+			await this.agent.prompt([]);
+			return;
+		}
+		await this.agent.continue();
 	}
 
 	/**
@@ -2608,6 +2681,117 @@ export class AgentSession {
 		return this._resourceLoader;
 	}
 
+	/** Whether the idle branch has an unfinished turn that can be continued. */
+	get canContinueInterruptedRun(): boolean {
+		return this.isIdle && this._findInterruptedRun() !== undefined && this._hasInterruptedRunContext();
+	}
+
+	/** Decline continuation on this branch without changing the conversation. */
+	dismissInterruptedRun(): void {
+		if (!this.canContinueInterruptedRun) return;
+		this.sessionManager.appendCustomEntry(DISMISSED_INTERRUPTED_RUN_ENTRY);
+		this._interruptedRun = undefined;
+	}
+
+	/** Resume an interrupted or failed run from the transcript without adding a user message. */
+	async continueInterruptedRun(): Promise<"continued" | "busy" | "nothing-to-continue"> {
+		if (!this.isIdle || this._isEmittingAgentSettled || this._promptPreflightCount > 0) return "busy";
+		const entry = this._findInterruptedRun();
+		if (!entry || !this._hasInterruptedRunContext()) return "nothing-to-continue";
+
+		const run = this._interruptedRun;
+		const promptOptions =
+			run?.entryId === entry.id && run.sessionId === this.sessionId ? run.promptOptions : undefined;
+		const systemMessage = promptOptions ? undefined : getCurrentSystemMessage(this.messages);
+		const recordedPrompt = systemMessage ? getSystemMessageText(systemMessage) : undefined;
+		const updateMessage =
+			!promptOptions && recordedPrompt === undefined
+				? this._preparePromptAndToolLoadout(normalizeBuildSystemPromptOptions(this._baseSystemPromptOptions))
+				: undefined;
+		this._beginAgentRun();
+		this._runSystemPromptOptions = promptOptions;
+		this._recordedRunSystemPrompt = recordedPrompt;
+		if (entry.type === "message" && entry.message.role === "assistant" && entry.message.stopReason === "error") {
+			this._failedResponse = entry.message;
+		}
+		this._overflowRecoveryAttempted = false;
+		this._recordSelection();
+		this._pendingToolNames.clear();
+		// Agent.continue() rejects a trailing raw assistant entry, even when the provider
+		// projection omits it. Start from that projection instead of resubmitting a prompt.
+		await this._runAgent(() => this.agent.prompt(updateMessage ? [updateMessage] : []));
+		return "continued";
+	}
+
+	private _findInterruptedRun(): SessionEntry | undefined {
+		const manager = this.sessionManager;
+		let retained: Set<string> | undefined;
+		let retainedFailure: SessionEntry | undefined;
+		for (
+			let entry = manager.getLeafEntry();
+			entry;
+			entry = entry.parentId ? manager.getEntry(entry.parentId) : undefined
+		) {
+			if (entry.type === "custom") {
+				if (entry.customType === INTERRUPTED_RUN_ENTRY) return retained ? undefined : entry;
+				if (entry.customType === DISMISSED_INTERRUPTED_RUN_ENTRY) return undefined;
+			}
+			if (entry.type === "branch_summary") return undefined;
+			if (entry.type === "compaction") {
+				if (retained) return undefined;
+				// A summary is not the turn's input. Only cross this boundary if both the
+				// failed response and its original user message are still in the retained range.
+				retained = new Set(
+					manager
+						.buildSessionProjection()
+						.entries.filter(({ messages }) => messages.length > 0)
+						.map(({ sourceEntry }) => sourceEntry.id),
+				);
+			}
+			if (entry.type !== "message") continue;
+			if (entry.message.role === "user") return retained?.has(entry.id) ? retainedFailure : undefined;
+			if (entry.message.role === "assistant") {
+				const stop = entry.message.stopReason;
+				if (stop === "aborted" || stop === "error") {
+					if (!retained) return entry;
+					if (!retainedFailure) {
+						if (!retained.has(entry.id)) return undefined;
+						retainedFailure = entry;
+					}
+				} else if (!retainedFailure || stop !== "toolUse") {
+					return undefined;
+				}
+			}
+		}
+		return undefined;
+	}
+
+	private _hasInterruptedRunContext(): boolean {
+		const lastTurnMessage = this.messages.findLast(
+			(message) => message.role === "user" || message.role === "assistant" || message.role === "toolResult",
+		);
+		// A context-only message after a completed reply does not reopen that turn.
+		if (lastTurnMessage?.role === "assistant" && lastTurnMessage.stopReason === "stop") return false;
+		// The provider projection drops aborted/failed attempts. Keep earlier tool exchanges,
+		// but do not send an incomplete batch (for example, after navigating to one result).
+		const messages = convertToLlm(this.messages);
+		const last = messages.findLast((message) => message.role !== "system");
+		if (last?.role !== "user" && last?.role !== "toolResult") return false;
+		const pending = new Set<string>();
+		for (const message of messages) {
+			if (message.role === "system") continue;
+			if (message.role === "toolResult") {
+				if (!pending.delete(message.toolCallId)) return false;
+			} else {
+				if (pending.size > 0) return false;
+				if (message.role === "assistant") {
+					for (const part of message.content) if (part.type === "toolCall") pending.add(part.id);
+				}
+			}
+		}
+		return pending.size === 0;
+	}
+
 	/**
 	 * Abort current operation and wait for agent to become idle.
 	 */
@@ -2660,7 +2844,9 @@ export class AgentSession {
 		}
 
 		const previousModel = this.model;
-		const thinkingLevel = this._getThinkingLevelForModelSwitch(model);
+		const modelThinkingLevel = modelsAreEqual(previousModel, model)
+			? this._modelThinkingLevel
+			: this.settingsManager.getModelThinkingLevel(model.provider, model.id);
 		this.agent.state.model = model;
 		this.sessionManager.appendModelChange(model.provider, model.id);
 		if (options.persist) {
@@ -2668,10 +2854,7 @@ export class AgentSession {
 			this._addPersistedDefaultToNonEmptyScope(model);
 		}
 
-		// Apply thinking level for the new model.
-		// Per-model thinking level overrides take priority over the global default.
-		// Model persistence does not implicitly rewrite the global thinking default.
-		this.setThinkingLevel(thinkingLevel);
+		this._applyThinkingLevel(this._preferredThinkingLevel, modelThinkingLevel);
 
 		await this._emitModelSelect(model, previousModel, "set");
 	}
@@ -2721,7 +2904,8 @@ export class AgentSession {
 		const nextIndex = getNextCycleIndex(currentIndex, scopedModels.length, direction);
 		if (nextIndex === undefined) return undefined;
 		const next = scopedModels[nextIndex];
-		const thinkingLevel = this._getThinkingLevelForModelSwitch(next.model, next.thinkingLevel);
+		const modelThinkingLevel =
+			next.thinkingLevel ?? this.settingsManager.getModelThinkingLevel(next.model.provider, next.model.id);
 
 		// Apply model
 		this.agent.state.model = next.model;
@@ -2731,12 +2915,7 @@ export class AgentSession {
 			this._addPersistedDefaultToNonEmptyScope(next.model);
 		}
 
-		// Apply thinking level for the new model.
-		// - Explicit scoped model thinking level overrides defaults
-		// - Per-model thinking level overrides take priority over the global default
-		// setThinkingLevel clamps to model capabilities.
-		// Model persistence does not implicitly rewrite the global thinking default.
-		this.setThinkingLevel(thinkingLevel);
+		this._applyThinkingLevel(this._preferredThinkingLevel, modelThinkingLevel);
 
 		await this._emitModelSelect(next.model, currentModel, "cycle");
 
@@ -2754,7 +2933,6 @@ export class AgentSession {
 		if (nextIndex === undefined) return undefined;
 		const nextModel = availableModels[nextIndex];
 
-		const thinkingLevel = this._getThinkingLevelForModelSwitch(nextModel);
 		this.agent.state.model = nextModel;
 		this.sessionManager.appendModelChange(nextModel.provider, nextModel.id);
 		if (options.persist) {
@@ -2762,9 +2940,10 @@ export class AgentSession {
 			this._addPersistedDefaultToNonEmptyScope(nextModel);
 		}
 
-		// Apply thinking level for the new model.
-		// Model persistence does not implicitly rewrite the global thinking default.
-		this.setThinkingLevel(thinkingLevel);
+		this._applyThinkingLevel(
+			this._preferredThinkingLevel,
+			this.settingsManager.getModelThinkingLevel(nextModel.provider, nextModel.id),
+		);
 
 		await this._emitModelSelect(nextModel, currentModel, "cycle");
 
@@ -2776,27 +2955,40 @@ export class AgentSession {
 	// =========================================================================
 
 	/**
-	 * Set thinking level.
-	 * Clamps to model capabilities based on available thinking levels.
-	 * Saves the clamped level to the session transcript only if the level actually changes.
+	 * Set and record the preferred thinking level, clamping only the active model's effective level.
 	 * Persists the requested level to global defaults only when options.persist is true.
 	 */
 	setThinkingLevel(level: ThinkingLevel, options: ModelMutationOptions = {}): void {
-		const availableLevels = this.getAvailableThinkingLevels();
-		const effectiveLevel = availableLevels.includes(level) ? level : this._clampThinkingLevel(level, availableLevels);
+		if (options.persist) this.settingsManager.setDefaultThinkingLevel(level);
+		this._applyThinkingLevel(level);
+	}
 
-		// Only persist if actually changing
-		const previousLevel = this.agent.state.thinkingLevel;
-		const isChanging = effectiveLevel !== previousLevel;
+	/** Save or clear a model override without changing the underlying session preference. */
+	setModelThinkingLevel(provider: string, modelId: string, level: ThinkingLevel | undefined): void {
+		if (level === undefined) {
+			this.settingsManager.removeModelThinkingLevel(provider, modelId);
+		} else {
+			this.settingsManager.setModelThinkingLevel(provider, modelId, level);
+		}
+		if (this.model?.provider === provider && this.model.id === modelId) {
+			this._applyThinkingLevel(this._preferredThinkingLevel, level);
+		}
+	}
 
+	private _applyThinkingLevel(preferredLevel: ThinkingLevel, modelLevel?: ThinkingLevel): void {
+		const requestedLevel = modelLevel ?? preferredLevel;
+		const modelOverride = requestedLevel === preferredLevel ? undefined : requestedLevel;
+		const previousLevel = this.thinkingLevel;
+		const effectiveLevel = this.model ? clampThinkingLevel(this.model, requestedLevel) : "off";
 		this.agent.state.thinkingLevel = effectiveLevel;
 
-		if (options.persist) {
-			this.settingsManager.setDefaultThinkingLevel(level);
+		if (preferredLevel !== this._preferredThinkingLevel || modelOverride !== this._modelThinkingLevel) {
+			this._preferredThinkingLevel = preferredLevel;
+			this._modelThinkingLevel = modelOverride;
+			this.sessionManager.appendThinkingLevelChange(preferredLevel, modelOverride);
 		}
 
-		if (isChanging) {
-			this.sessionManager.appendThinkingLevelChange(effectiveLevel);
+		if (effectiveLevel !== previousLevel) {
 			this._emit({ type: "thinking_level_changed", level: effectiveLevel });
 			void this._extensionRunner.emit({
 				type: "thinking_level_select",
@@ -2836,24 +3028,6 @@ export class AgentSession {
 	 */
 	supportsThinking(): boolean {
 		return !!this.model?.reasoning;
-	}
-
-	private _getThinkingLevelForModelSwitch(targetModel?: Model<any>, explicitLevel?: ThinkingLevel): ThinkingLevel {
-		if (explicitLevel !== undefined) {
-			return explicitLevel;
-		}
-		// Per-model default takes priority when switching to a model that has one
-		if (targetModel) {
-			const perModel = this.settingsManager.getModelThinkingLevel(targetModel.provider, targetModel.id);
-			if (perModel !== undefined) {
-				return perModel;
-			}
-		}
-		return this.settingsManager.getDefaultThinkingLevel() ?? this.thinkingLevel ?? DEFAULT_THINKING_LEVEL;
-	}
-
-	private _clampThinkingLevel(level: ThinkingLevel, _availableLevels: ThinkingLevel[]): ThinkingLevel {
-		return this.model ? (clampThinkingLevel(this.model, level) as ThinkingLevel) : "off";
 	}
 
 	// =========================================================================
@@ -4310,6 +4484,8 @@ export class AgentSession {
 				this.sessionManager.appendLabelChange(targetId, label);
 			}
 
+			// The interrupted run belonged to the branch we just left.
+			this._interruptedRun = undefined;
 			// Update finalized context from the canonical session projection.
 			this._refreshFinalizedContext();
 			this._restoreToolsFromTranscript();

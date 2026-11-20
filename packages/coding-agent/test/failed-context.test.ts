@@ -179,6 +179,184 @@ describe("failure-free model context", () => {
 		}
 	});
 
+	it("continues a provider failure before streaming on the newly selected model without resending the prompt", async () => {
+		const harness = await createHarness({
+			models: [{ id: "out-of-credits" }, { id: "replacement" }],
+			settings: { retry: { enabled: true, maxRetries: 1, baseDelayMs: 1 } },
+		});
+		const image = {
+			type: "image" as const,
+			mimeType: "image/png",
+			data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==",
+		};
+		let continuedMessages: Message[] = [];
+		let continuedModel: string | undefined;
+		try {
+			harness.setResponses([
+				() => {
+					throw new Error("Insufficient credits");
+				},
+				fauxAssistantMessage([], { stopReason: "error", errorMessage: "overloaded_error" }),
+				(context, _options, _state, model) => {
+					continuedMessages = context.messages.filter((message) => message.role !== "system");
+					continuedModel = model.id;
+					return fauxAssistantMessage("Recovered");
+				},
+			]);
+			await harness.session.prompt("Review this image", { images: [image] });
+			expect(harness.session.canContinueInterruptedRun).toBe(true);
+			await harness.session.setModel(harness.models[1]!);
+			expect(await harness.session.continueInterruptedRun()).toBe("continued");
+			expect(continuedModel).toBe("replacement");
+			expect(continuedMessages).toEqual([
+				expect.objectContaining({ role: "user", content: [{ type: "text", text: "Review this image" }, image] }),
+			]);
+			expect(harness.session.messages.filter((message) => message.role === "user")).toEqual(continuedMessages);
+			expect(harness.session.messages).toContainEqual(
+				expect.objectContaining({ role: "assistant", stopReason: "error", errorMessage: "Insufficient credits" }),
+			);
+			await harness.session.sendCustomMessage({ customType: "aside", content: "Context only", display: false });
+			expect(await harness.session.continueInterruptedRun()).toBe("nothing-to-continue");
+			expect(harness.faux.state.callCount).toBe(3);
+			expect(harness.eventsOfType("auto_retry_end")).toEqual([
+				expect.objectContaining({ success: true, attempt: 1 }),
+			]);
+		} finally {
+			harness.cleanup();
+		}
+	});
+
+	it("honors a boundary continuation from a failed raw assistant tail", async () => {
+		const harness = await createHarness({
+			settings: { retry: { enabled: false } },
+			extensionFactories: [
+				(pi) => {
+					pi.on("agent_before_settle", (event) => {
+						if (event.outcome === "error") return { continue: true };
+					});
+				},
+			],
+		});
+		let continuedMessages: Message[] = [];
+		try {
+			harness.setResponses([
+				fauxAssistantMessage([], { stopReason: "error", errorMessage: "Insufficient credits" }),
+				(context) => {
+					continuedMessages = context.messages.filter((message) => message.role !== "system");
+					return fauxAssistantMessage("Recovered");
+				},
+			]);
+			await harness.session.prompt("Run the task");
+			expect(continuedMessages).toEqual([
+				expect.objectContaining({ role: "user", content: [fauxText("Run the task")] }),
+			]);
+			expect(harness.faux.state.callCount).toBe(2);
+		} finally {
+			harness.cleanup();
+		}
+	});
+
+	it("offers continuation only on the reopened failed branch until it is dismissed", async () => {
+		const manager = SessionManager.inMemory();
+		manager.appendMessage({ role: "user", content: "Completed branch", timestamp: 1 });
+		const completedId = manager.appendMessage(fauxAssistantMessage("Complete"));
+		manager.appendMessage({ role: "user", content: "Retry this", timestamp: 2 });
+		const failedId = manager.appendMessage(fauxAssistantMessage([], { stopReason: "error" }));
+		const harness = await createHarness({ sessionManager: manager });
+		harness.session.refreshContext();
+		try {
+			expect(harness.session.canContinueInterruptedRun).toBe(true);
+			await harness.session.navigateTree(completedId);
+			expect(await harness.session.continueInterruptedRun()).toBe("nothing-to-continue");
+			await harness.session.navigateTree(failedId);
+			expect(harness.session.canContinueInterruptedRun).toBe(true);
+			harness.session.dismissInterruptedRun();
+			expect(await harness.session.continueInterruptedRun()).toBe("nothing-to-continue");
+			expect(harness.faux.state.callCount).toBe(0);
+		} finally {
+			harness.cleanup();
+		}
+	});
+
+	it.each([true, false])("after compaction, resumes only if the original prompt was retained (%s)", async (kept) => {
+		const manager = SessionManager.inMemory();
+		const userId = manager.appendMessage({ role: "user", content: "Retry this original prompt", timestamp: 1 });
+		const failedId = manager.appendMessage(fauxAssistantMessage([], { stopReason: "error" }));
+		manager.appendCompaction("Earlier history", kept ? userId : failedId, 100);
+		const harness = await createHarness({ sessionManager: manager });
+		harness.session.refreshContext();
+		try {
+			harness.setResponses([fauxAssistantMessage("Recovered")]);
+			expect(await harness.session.continueInterruptedRun()).toBe(kept ? "continued" : "nothing-to-continue");
+			expect(harness.faux.state.callCount).toBe(kept ? 1 : 0);
+		} finally {
+			harness.cleanup();
+		}
+	});
+
+	it("continues an interrupted tool batch from its completed result without running the tool again", async () => {
+		const toolStarted = Promise.withResolvers<void>();
+		let completedCalls = 0;
+		const parameters = Type.Object({ wait: Type.Boolean() });
+		const tool: AgentTool<typeof parameters> = {
+			name: "checked",
+			label: "Checked",
+			description: "Record completed and interrupted calls",
+			parameters,
+			execute: async (_id, args, signal) => {
+				if (args.wait) {
+					toolStarted.resolve();
+					await new Promise<void>((resolve) => signal?.addEventListener("abort", () => resolve(), { once: true }));
+					throw new Error("Operation aborted");
+				}
+				completedCalls++;
+				return { content: [fauxText("Completed once")], details: undefined };
+			},
+		};
+		// The harness erases tool types; the agent validates arguments against parameters before execute.
+		const harness = await createHarness({ tools: [tool as AgentTool] });
+		harness.session.agent.toolExecution = "sequential";
+		let continuedMessages: Message[] = [];
+		try {
+			harness.setResponses([
+				fauxAssistantMessage(
+					[
+						fauxToolCall("checked", { wait: false }, { id: "completed" }),
+						fauxToolCall("checked", { wait: true }, { id: "interrupted" }),
+					],
+					{ stopReason: "toolUse" },
+				),
+			]);
+			const run = harness.session.prompt("Check both files");
+			await toolStarted.promise;
+			expect(await harness.session.continueInterruptedRun()).toBe("busy");
+			await harness.session.abort();
+			await run;
+			harness.setResponses([
+				(context) => {
+					continuedMessages = context.messages.filter((message) => message.role !== "system");
+					return fauxAssistantMessage("Recovered");
+				},
+			]);
+			expect(await harness.session.continueInterruptedRun()).toBe("continued");
+			expect(continuedMessages).toEqual([
+				expect.objectContaining({ role: "user" }),
+				expect.objectContaining({
+					role: "assistant",
+					content: [expect.objectContaining({ type: "toolCall", id: "completed" })],
+				}),
+				expect.objectContaining({
+					role: "toolResult",
+					toolCallId: "completed",
+					content: [fauxText("Completed once")],
+				}),
+			]);
+			expect(completedCalls).toBe(1);
+		} finally {
+			harness.cleanup();
+		}
+	});
+
 	it("does not replay exhausted-account responses after the user continues", async () => {
 		const harness = await createHarness({ settings: { retry: { enabled: false } } });
 		try {

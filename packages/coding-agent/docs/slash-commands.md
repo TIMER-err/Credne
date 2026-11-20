@@ -25,6 +25,7 @@ Extensions, prompt templates, and skills can add commands. The command menu in P
 |---|---|
 | `/new` | Start a new session |
 | `/resume` | Resume another session |
+| `/continue` | Continue the last interrupted or failed turn without sending a new prompt |
 | `/name [name]` | Set the session display name, or show the current name when omitted |
 | `/session` | Show current session information and statistics |
 | `/tree` | Navigate the session tree |
@@ -32,6 +33,10 @@ Extensions, prompt templates, and skills can add commands. The command menu in P
 | `/clone` | Duplicate the current session at its current position |
 | `/compact [instructions]` | Compact the current context, optionally with custom instructions |
 | `/import <path>` | Import a JSONL session, preserving its ID and working directory |
+
+Use `/continue` after interrupting a turn or after a provider failure, such as running out of credits. You can switch accounts or models first. The command uses the original prompt, including attachments, and keeps completed tool results in context. It does not restart a completed turn.
+
+When you reopen an unfinished session with `/resume`, `-r`, or `-c`, you can continue the turn or stop and give new instructions. Press Escape to close the menu without deciding, for example to switch accounts first. A new prompt supplied at startup skips this menu. Reopening uses the recorded system prompt and tool loadout; system prompts that extensions force for a single run are not saved.
 
 ## Export and share
 

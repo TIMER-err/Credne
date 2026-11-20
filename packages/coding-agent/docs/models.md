@@ -28,7 +28,7 @@ Keep `auth.json` and any credential commands private. Project settings and exten
 
 Run `/model` to search available models. The picker shows models whose providers have usable authentication. Selecting a model, entering `/model <name>`, or cycling models remembers the model and provider/account for new sessions across projects. `Ctrl+S` also saves the selection. Explicit CLI options and project settings take precedence over the saved default.
 
-Run `/thinking [level]` or `/effort [level]` to set the current model's reasoning level. Without a level, either command opens a selector limited to levels supported by the selected model. An explicit level applies to the current session; press `Ctrl+S` in the selector to save the startup default.
+Run `/thinking [level]` or `/effort [level]` to set the current model's reasoning level. Without a level, either command opens a selector limited to levels supported by the selected model. The level you choose follows the session across models and accounts. For example, if you select `high`, switch to a model without reasoning, then switch to Astra, Astra uses `high` again. A configured per-model level or explicit cycling suffix overrides the preference only on that model. Press `Ctrl+S` in the selector to save the startup default for new sessions.
 
 `Ctrl+P` cycles through available models. Use `/scoped-models` to control that cycle and save the selection, or configure model patterns through [Settings](settings.md#model-cycling).
 

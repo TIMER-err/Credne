@@ -1,7 +1,13 @@
 import { join } from "node:path";
 import { Agent, type AgentMessage, setDefaultStreamFn, type ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { ModelsSimpleStreamOptions } from "@earendil-works/pi-ai";
-import { clampThinkingLevel, type Message, type Model, streamSimple } from "@earendil-works/pi-ai/compat";
+import {
+	clampThinkingLevel,
+	type Message,
+	type Model,
+	modelsAreEqual,
+	streamSimple,
+} from "@earendil-works/pi-ai/compat";
 import { getAgentDir } from "../config.ts";
 import { resolvePath } from "../utils/paths.ts";
 import { AgentSession, markRuntimeStreamFunction } from "./agent-session.ts";
@@ -209,16 +215,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	// Check if session has existing data to restore
 	const existingSession = sessionManager.buildSessionContext();
 	const hasExistingSession = existingSession.messages.length > 0;
-	const hasThinkingEntry = sessionManager.getBranch().some((entry) => entry.type === "thinking_level_change");
+	const branch = sessionManager.getBranch();
+	const recordedThinking = hasExistingSession
+		? branch.findLast((entry) => entry.type === "thinking_level_change")
+		: undefined;
 
 	let model = options.model;
 	let modelFallbackMessage: string | undefined;
 
 	// Assistant messages name the physical model that answered, so a virtual selection is only in
 	// model_change entries.
-	const sessionModel = getBranchSelection(sessionManager.getBranch(), (provider, modelId) =>
-		modelRuntime.getModel(provider, modelId),
-	);
+	const sessionModel = getBranchSelection(branch, (provider, modelId) => modelRuntime.getModel(provider, modelId));
 
 	// If session has data, try to restore model from it
 	if (!model && hasExistingSession && sessionModel) {
@@ -250,32 +257,27 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		}
 	}
 
-	let thinkingLevel = options.thinkingLevel;
-
-	// If session has data, restore thinking level from it
-	if (thinkingLevel === undefined && hasExistingSession) {
-		thinkingLevel = hasThinkingEntry
-			? (existingSession.thinkingLevel as ThinkingLevel)
-			: (settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL);
-	}
-
-	// Fall back to per-model override, then global default
-	if (thinkingLevel === undefined && model) {
-		const perModel = settingsManager.getModelThinkingLevel(model.provider, model.id);
-		if (perModel) {
-			thinkingLevel = perModel;
+	const preferredThinkingLevel =
+		options.thinkingLevel ??
+		(recordedThinking?.thinkingLevel as ThinkingLevel | undefined) ??
+		settingsManager.getDefaultThinkingLevel() ??
+		DEFAULT_THINKING_LEVEL;
+	let modelThinkingLevel: ThinkingLevel | undefined;
+	if (options.thinkingLevel === undefined && model) {
+		const restoredSelection =
+			recordedThinking &&
+			(!sessionModel || (model.provider === sessionModel.provider && model.id === sessionModel.modelId));
+		if (restoredSelection) {
+			// No override in a recorded selection means the user was using the session preference on this model.
+			modelThinkingLevel = recordedThinking.modelThinkingLevel as ThinkingLevel | undefined;
+		} else {
+			modelThinkingLevel =
+				options.scopedModels?.find((scoped) => modelsAreEqual(scoped.model, model))?.thinkingLevel ??
+				settingsManager.getModelThinkingLevel(model.provider, model.id);
 		}
 	}
-	if (thinkingLevel === undefined) {
-		thinkingLevel = settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL;
-	}
-
-	// Clamp to model capabilities
-	if (!model) {
-		thinkingLevel = "off";
-	} else {
-		thinkingLevel = clampThinkingLevel(model, thinkingLevel) as ThinkingLevel;
-	}
+	if (modelThinkingLevel === preferredThinkingLevel) modelThinkingLevel = undefined;
+	const thinkingLevel = model ? clampThinkingLevel(model, modelThinkingLevel ?? preferredThinkingLevel) : "off";
 
 	const toolListError = options.tools ? getToolListError(options.tools) : undefined;
 	if (toolListError) throw new Error(`Invalid tools option: ${toolListError}`);
@@ -439,17 +441,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	// This stream resolves auth through modelRuntime, so summaries must not pre-resolve it (#11520).
 	markRuntimeStreamFunction(agent.streamFunction, modelRuntime);
 
-	// Restore missing settings metadata for older sessions.
-	if (hasExistingSession) {
-		if (!hasThinkingEntry) {
-			sessionManager.appendThinkingLevelChange(thinkingLevel);
-		}
-	} else {
-		// Save initial model and thinking level for new sessions so they can be restored on resume
-		if (model) {
-			sessionManager.appendModelChange(model.provider, model.id);
-		}
-		sessionManager.appendThinkingLevelChange(thinkingLevel);
+	// Record selections for resume, including startup overrides and levels the current model clamps.
+	if (!hasExistingSession && model) {
+		sessionManager.appendModelChange(model.provider, model.id);
+	}
+	if (
+		recordedThinking?.thinkingLevel !== preferredThinkingLevel ||
+		recordedThinking.modelThinkingLevel !== modelThinkingLevel
+	) {
+		sessionManager.appendThinkingLevelChange(preferredThinkingLevel, modelThinkingLevel);
 	}
 
 	const session = new AgentSession({
@@ -457,6 +457,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		sessionManager,
 		settingsManager,
 		cwd,
+		preferredThinkingLevel,
+		modelThinkingLevel,
 		scopedModels: options.scopedModels,
 		resourceLoader,
 		customTools: options.customTools,

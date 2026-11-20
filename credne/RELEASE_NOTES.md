@@ -1,14 +1,18 @@
-# Credne 0.1.2
+# Credne 0.1.3
 
-ChatGPT accounts can start and resume conversations with the planning tools enabled. In 0.1.1, Codex rejected the tool declarations for `assign_tasks` and `cancel_tasks` because they contained the unsupported JSON Schema keyword `uniqueItems`. Credne now checks for duplicate task IDs locally before assigning or cancelling workers.
+- After a provider error such as “no credits remaining,” switch to a funded account or top up the current one, then run `/continue`. Credne retries the pending turn with its original prompt and attachments.
+- Switching models or accounts keeps your chosen reasoning effort unless you configured an explicit level for the destination. A model with fewer supported levels uses a compatible level without overwriting your preference.
 
-## Windows x64 package
+## Install on Windows x64
 
-Extract `credne-0.1.2-windows-x64.tar.gz` into a new directory. The package includes the CLI, broker, assets, and runtime dependencies. It requires Node.js 22.19 or newer. From the extracted package directory, run:
+Install Node.js 22.19 or newer, then run these commands from any directory. The package includes the account broker and runtime dependencies.
 
 ```shell
-node dist/bundle/cli.js --version --offline
-node dist/bundle/cli.js
+npm.cmd install --global --ignore-scripts https://github.com/neilhuang007/Credne/releases/download/0.1.3/credne-0.1.3-windows-x64.tgz
+credne.cmd --version
+credne.cmd
 ```
 
-Existing Credne accounts and settings carry over.
+`credne.cmd --version` should print `0.1.3`. Install [Git for Windows](https://git-scm.com/download/win) if you need Bash for shell commands. Existing accounts and settings are kept. For a first install, use `/accounts add` inside Credne.
+
+On macOS or Linux, follow the [source installation instructions for 0.1.3](https://github.com/neilhuang007/Credne/blob/0.1.3/README.md#credne) to build the broker for your platform.

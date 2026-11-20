@@ -71,6 +71,8 @@
 - Fixed pi crashing with `RangeError: Maximum call stack size exceeded` when rendering a very large edit diff, for example after editing a file with a multi-megabyte line, and again on every resume of that session ([#8036](https://github.com/earendil-works/pi/issues/8036))
 - Fixed pressing Esc during a batch of tool calls leaving the calls that had not started yet without a result in the session; they now get an "Operation aborted" result ([#9986](https://github.com/earendil-works/pi/issues/9986))
 * Fixed ChatGPT accounts rejecting requests because the planning tools declared `uniqueItems`. Credne still rejects duplicate task IDs before assigning or cancelling workers.
+- `/continue` can retry the latest failed provider request, including an exhausted-credit error, without retyping the prompt.
+- Switching models and accounts retains the selected reasoning effort even after using a model with fewer supported levels.
 
 ### Removed
 

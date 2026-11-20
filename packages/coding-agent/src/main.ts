@@ -503,12 +503,10 @@ function buildSessionOptions(
 	settingsManager: SettingsManager,
 ): {
 	options: CreateAgentSessionOptions;
-	cliThinkingFromModel: boolean;
 	diagnostics: AgentSessionRuntimeDiagnostic[];
 } {
 	const options: CreateAgentSessionOptions = {};
 	const diagnostics: AgentSessionRuntimeDiagnostic[] = [];
-	let cliThinkingFromModel = false;
 
 	// Model from CLI
 	// - supports --provider <name> --model <pattern>
@@ -539,7 +537,6 @@ function buildSessionOptions(
 			// Explicit --thinking still takes precedence (applied later).
 			if (!parsed.thinking && resolved.thinkingLevel) {
 				options.thinkingLevel = resolved.thinkingLevel;
-				cliThinkingFromModel = true;
 			}
 		}
 	}
@@ -551,29 +548,17 @@ function buildSessionOptions(
 		const savedModel = savedProvider && savedModelId ? modelRuntime.getModel(savedProvider, savedModelId) : undefined;
 		const savedInScope = savedModel ? scopedModels.find((sm) => modelsAreEqual(sm.model, savedModel)) : undefined;
 
-		if (savedInScope) {
-			options.model = savedInScope.model;
-			// Use thinking level from scoped model config if explicitly set
-			if (!parsed.thinking && savedInScope.thinkingLevel) {
-				options.thinkingLevel = savedInScope.thinkingLevel;
-			}
-		} else {
-			options.model = scopedModels[0].model;
-			// Use thinking level from first scoped model if explicitly set
-			if (!parsed.thinking && scopedModels[0].thinkingLevel) {
-				options.thinkingLevel = scopedModels[0].thinkingLevel;
-			}
-		}
+		options.model = savedInScope?.model ?? scopedModels[0].model;
 	}
 
-	// Thinking level from CLI (takes precedence over scoped model thinking levels set above)
+	// An explicit CLI thinking level takes precedence over model-specific defaults.
 	if (parsed.thinking) {
 		options.thinkingLevel = parsed.thinking;
 	}
 
 	// Scoped models for Ctrl+P cycling
 	// Keep thinking level undefined when not explicitly set in the model pattern.
-	// Undefined means "inherit current session thinking level" during cycling.
+	// Undefined means "inherit the session's preferred thinking level" during cycling.
 	if (scopedModels.length > 0) {
 		options.scopedModels = scopedModels.map((sm) => ({
 			model: sm.model,
@@ -597,7 +582,7 @@ function buildSessionOptions(
 		options.excludeTools = [...parsed.excludeTools];
 	}
 
-	return { options, cliThinkingFromModel, diagnostics };
+	return { options, diagnostics };
 }
 
 function resolveCliPaths(cwd: string, paths: string[] | undefined): string[] | undefined {
@@ -878,11 +863,7 @@ export async function main(args: string[], options?: MainOptions) {
 		// Returned as diagnostics instead of printed: this factory runs again on /new, /resume and /fork,
 		// while the interactive TUI draws on the terminal (#11264).
 		diagnostics.push(...modelScopeDiagnostics);
-		const {
-			options: sessionOptions,
-			cliThinkingFromModel,
-			diagnostics: sessionOptionDiagnostics,
-		} = buildSessionOptions(
+		const { options: sessionOptions, diagnostics: sessionOptionDiagnostics } = buildSessionOptions(
 			parsed,
 			scopedModels,
 			sessionManager.buildSessionContext().messages.length > 0,
@@ -914,11 +895,6 @@ export async function main(args: string[], options?: MainOptions) {
 			noTools: sessionOptions.noTools,
 			customTools: sessionOptions.customTools,
 		});
-		const cliThinkingOverride = parsed.thinking !== undefined || cliThinkingFromModel;
-		if (created.session.model && cliThinkingOverride) {
-			created.session.setThinkingLevel(created.session.thinkingLevel);
-		}
-
 		return {
 			...created,
 			services,
