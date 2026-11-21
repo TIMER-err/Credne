@@ -124,7 +124,7 @@ export default function planningExtension(pi: ExtensionAPI): void {
 	function openPlanMode(): string | undefined {
 		if (planOpen) return undefined;
 		planOpen = true;
-		return revealTools(pi, PLAN_MODE_TOOLS);
+		return revealTools(pi, PLAN_MODE_TOOLS, "Here are the relevant tools for planning:");
 	}
 
 	// The widget above the input box and the side panel section show the same plan; the widget

@@ -365,7 +365,7 @@ export default function (pi: ExtensionAPI) {
 		let revealed: string | undefined;
 		if (!delegated) {
 			delegated = true;
-			revealed = revealTools(pi, DELEGATION_TOOLS);
+			revealed = revealTools(pi, DELEGATION_TOOLS, "Here are the relevant tools for subagents:");
 		}
 		// Tool execute results cannot set runtime error state directly, so patch it through the result hook.
 		const isError = event.toolName === "subagent" && (event.details as SubagentDetails | undefined)?.isError;
@@ -385,7 +385,7 @@ export default function (pi: ExtensionAPI) {
 			"Explorer: choose a cheap, fast model at medium or high thinking effort to search and return information, not to reason about solutions. Worker: choose a capable middle-tier model, such as Sol or Opus 5.5, at xhigh effort to reason during implementation. Crazy: choose an expensive, highly capable model at xhigh or max effort and supply focused context and references so it can concentrate on the hard problem.",
 			"Use background: true for independent work while you continue, then receive each result automatically. Use foreground execution when your next step needs the result immediately.",
 			"Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
-			"The coordination tools, search_models and get_subagent_context are declared after your first subagent call. Use search_models once when selecting a model; it defaults to five compact cost-ranked results. Reuse a result while the route is valid, and refresh after model/account changes or dispatch failure. Prefer economical models for bounded tasks, but price does not guarantee capability. Use the bare modelId portion of a result ID to stay on the current account; include its provider only when intentionally changing routes.",
+			"Relevant subagent tools will be declared after your first call. Use search_models once when selecting a model; it defaults to five compact cost-ranked results. Reuse a result while the route is valid, and refresh after model/account changes or dispatch failure. Prefer economical models for bounded tasks, but price does not guarantee capability. Use the bare modelId portion of a result ID to stay on the current account; include its provider only when intentionally changing routes.",
 			"Choose model, reasoningEffort, and turn at the top level or per task or chain step. Explicit model overrides the agent profile. turn: 0 starts fresh with only the task, -1 also gives the subagent a copy of the conversation so far with tool outputs shortened, and a positive turn number gives that copy up to a checkpoint from get_subagent_context, including task completions or reviewed milestones. The copy is captured at submission. Use list_agents, send_agent_message, interrupt_agent, continue_agent, steer_agent, and change_agent_model to coordinate workers by ID. change_agent_model changes an idle or interrupted worker's model without losing its conversation; interrupt active workers first.",
 			`Default agent scope is "user" (from ${path.join(getAgentDir(), "agents")}).`,
 			`To enable project-local agents in ${CONFIG_DIR_NAME}/agents, set agentScope: "both" (or "project").`,

@@ -670,16 +670,16 @@ export const DELEGATION_TOOLS = [
 
 /**
  * Re-runs the `prepareLoadout` hooks, so tools a hook stopped hiding are declared from the model's
- * next call, and lists the active ones among `names` for the tool result that revealed them.
+ * next call, and lists the active ones among `names` under `heading` for the tool result that revealed them.
  */
-export function revealTools(pi: ExtensionAPI, names: readonly string[]): string | undefined {
+export function revealTools(pi: ExtensionAPI, names: readonly string[], heading: string): string | undefined {
 	const active = pi.getActiveTools();
 	pi.setActiveTools(active);
 	const lines = pi
 		.getAllTools()
 		.filter((tool) => names.includes(tool.name) && active.includes(tool.name))
 		.map((tool) => `- ${tool.name}: ${tool.description.trim().split(/\r?\n/)[0]}`);
-	return lines.length > 0 ? `These tools are declared from your next call:\n${lines.join("\n")}` : undefined;
+	return lines.length > 0 ? `${heading}\n${lines.join("\n")}` : undefined;
 }
 
 /**

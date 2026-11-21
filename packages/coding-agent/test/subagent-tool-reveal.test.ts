@@ -51,7 +51,7 @@ describe("subagent follow-up tools", () => {
 			.flatMap((entry) =>
 				entry.type === "message" && entry.message.role === "toolResult" ? [entry.message] : [],
 			)[0];
-		expect(JSON.stringify(result?.content)).toContain("These tools are declared from your next call");
+		expect(JSON.stringify(result?.content)).toContain("Here are the relevant tools for subagents:");
 	});
 
 	it("are declared on a resumed branch that already delegated", async () => {
