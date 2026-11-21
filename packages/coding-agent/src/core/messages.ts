@@ -23,6 +23,9 @@ export const BRANCH_SUMMARY_PREFIX = `The following is a summary of a branch tha
 
 export const BRANCH_SUMMARY_SUFFIX = `</summary>`;
 
+/** Transcript label for messages omitted from model context. */
+export const HIDDEN_CONTEXT_LABEL = "(hidden to the agent)";
+
 /**
  * Message type for bash executions via the ! command.
  */
@@ -137,16 +140,19 @@ export function createCustomMessage(
 	};
 }
 
-/** Exclude failed exchanges from model context without changing the saved transcript. */
+/** Exclude failed provider attempts while preserving tool and command diagnostics. */
 export function filterFailedMessages(messages: AgentMessage[]): AgentMessage[] {
 	return messages.flatMap(createFailureFilter(messages));
 }
 
-/** Create a filter that pairs failures across the complete context before selecting entries. */
+/** Pair omitted provider attempts with their tool results across the complete context. */
 export function createFailureFilter(messages: AgentMessage[]): (message: AgentMessage) => AgentMessage[] {
 	const omittedCalls = new Set<string>();
 	for (const message of messages) {
-		if (message.role === "toolResult" && message.isError) omittedCalls.add(message.toolCallId);
+		// Worker result details are extension metadata, so validate this boundary before classifying the failure.
+		if (message.role === "toolResult" && message.toolName === "subagent") {
+			if (isProviderFailureReport(message.details)) omittedCalls.add(message.toolCallId);
+		}
 		if (message.role === "assistant" && (message.stopReason === "error" || message.stopReason === "aborted")) {
 			for (const part of message.content) {
 				if (part.type === "toolCall") omittedCalls.add(part.id);
@@ -162,28 +168,38 @@ export function createFailureFilter(messages: AgentMessage[]): (message: AgentMe
 		}
 		if (message.role === "toolResult" && omittedCalls.has(message.toolCallId)) return [];
 		if (
-			message.role === "bashExecution" &&
-			(message.cancelled || (message.exitCode !== undefined && message.exitCode !== 0))
-		)
-			return [];
-		if (
 			message.role === "custom" &&
 			(message.customType === "subagent-result" || message.customType === "planning-result")
 		) {
-			const details = message.details;
-			if (details && typeof details === "object" && "result" in details) {
-				const result = details.result;
-				if (
-					result &&
-					typeof result === "object" &&
-					"status" in result &&
-					(result.status === "failed" || result.status === "aborted")
-				)
-					return [];
-			}
+			if (isProviderFailureReport(message.details)) return [];
 		}
 		return [message];
 	};
+}
+
+/** Identify worker reports containing only failed provider attempts. */
+export function isProviderFailureReport(details: unknown): boolean {
+	// Worker details are untyped extension metadata, including reports loaded from saved sessions.
+	if (!details || typeof details !== "object") return false;
+	if ("result" in details) return isFailedProviderResult(details.result);
+	return (
+		"results" in details &&
+		Array.isArray(details.results) &&
+		details.results.length > 0 &&
+		details.results.every(isFailedProviderResult)
+	);
+}
+
+function isFailedProviderResult(result: unknown): boolean {
+	// Worker reports arrive as untyped extension metadata, including reports loaded from saved sessions.
+	return (
+		result !== null &&
+		typeof result === "object" &&
+		"status" in result &&
+		result.status === "failed" &&
+		"stopReason" in result &&
+		result.stopReason === "error"
+	);
 }
 
 /**

@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, statSync } from "node:fs";
 import { delimiter, join } from "node:path";
+import { Agent, fetch as directFetch, type RequestInit, type Response } from "undici";
 
 /** Discovery record the broker writes to `<home>/broker.json` once it serves requests. */
 export interface BrokerConnection {
@@ -107,6 +108,13 @@ const HEALTH_TTL_MS = 15_000;
 const HEALTH_TIMEOUT_MS = 2_000;
 const START_TIMEOUT_MS = 20_000;
 const MAX_LOG_BYTES = 5 * 1024 * 1024;
+
+let brokerDispatcher: Agent | undefined;
+
+export function fetchBroker(url: string, options: RequestInit): Promise<Response> {
+	brokerDispatcher ??= new Agent();
+	return directFetch(url, { ...options, dispatcher: brokerDispatcher, redirect: "error" });
+}
 
 /**
  * Client for the shared account broker. Every harness process uses the same broker; the first
@@ -220,7 +228,7 @@ export class BrokerClient {
 	async shutdown(): Promise<void> {
 		const connection = await this.connectExisting();
 		if (!connection) return;
-		await fetch(`${connection.url}/credne/v1/shutdown`, {
+		await fetchBroker(`${connection.url}/credne/v1/shutdown`, {
 			method: "POST",
 			headers: { authorization: `Bearer ${connection.token}` },
 			signal: AbortSignal.timeout(HEALTH_TIMEOUT_MS),
@@ -232,7 +240,7 @@ export class BrokerClient {
 		const connection = await this.connect(signal);
 		let response: Response;
 		try {
-			response = await fetch(`${connection.url}/credne/v1${path}`, {
+			response = await fetchBroker(`${connection.url}/credne/v1${path}`, {
 				method,
 				headers: { authorization: `Bearer ${connection.token}`, "content-type": "application/json" },
 				body: body === undefined ? undefined : JSON.stringify(body),
@@ -335,7 +343,7 @@ export class BrokerClient {
 
 	private async healthy(connection: BrokerConnection, signal?: AbortSignal): Promise<boolean> {
 		try {
-			const response = await fetch(`${connection.url}/credne/v1/health`, {
+			const response = await fetchBroker(`${connection.url}/credne/v1/health`, {
 				headers: { authorization: `Bearer ${connection.token}` },
 				signal: signal
 					? AbortSignal.any([signal, AbortSignal.timeout(HEALTH_TIMEOUT_MS)])

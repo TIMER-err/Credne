@@ -20,6 +20,7 @@ function createWorkers(count: number): WorkerView[] {
 		task: "Locate renderer",
 		status: "completed",
 		agentType: "explorer",
+		cwd: process.cwd(),
 		inboxCount: 0,
 		assignmentCount: 0,
 		usage: emptyUsage(),

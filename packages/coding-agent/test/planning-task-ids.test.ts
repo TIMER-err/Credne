@@ -1,4 +1,4 @@
-import { fauxAssistantMessage, fauxToolCall, getInitialSystemMessage } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage, fauxToolCall, getCurrentTools, getInitialSystemMessage } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
 import planningExtension from "../src/extensions/planning/index.ts";
 import { createHarness } from "./suite/harness.ts";
@@ -10,7 +10,14 @@ describe("planning task IDs", () => {
 			await harness.session.bindExtensions({});
 			harness.setResponses([
 				(context) => {
-					const tool = getInitialSystemMessage(context.messages)?.toolsAdded?.find((entry) => entry.name === name);
+					// Plan tools stay undeclared until enter_plan_mode.
+					const initial = getInitialSystemMessage(context.messages)?.toolsAdded?.map((entry) => entry.name);
+					expect(initial).toContain("enter_plan_mode");
+					expect(initial).not.toContain(name);
+					return fauxAssistantMessage(fauxToolCall("enter_plan_mode", {}), { stopReason: "toolUse" });
+				},
+				(context) => {
+					const tool = getCurrentTools(context.messages).find((entry) => entry.name === name);
 					expect(tool?.parameters).toMatchObject({
 						properties: { taskIds: { type: "array", minItems: 1, maxItems: 4, items: { type: "string" } } },
 					});

@@ -67,7 +67,12 @@ function model(id: string, options: FixtureOptions = {}): Model<Api> {
 	};
 }
 
-function createContext(parent: Model<Api>, models: Model<Api>[]): ExtensionToolContext {
+/** A session entry for an assistant answer, as the branch of the session manager lists it. */
+function answer(provider: string, stopReason: "stop" | "error" = "stop"): unknown {
+	return { type: "message", message: { role: "assistant", provider, stopReason } };
+}
+
+function createContext(parent: Model<Api>, models: Model<Api>[], branch: unknown[] = []): ExtensionToolContext {
 	const registry = {
 		getAvailable: () => models,
 		getAll: () => models,
@@ -79,11 +84,11 @@ function createContext(parent: Model<Api>, models: Model<Api>[]): ExtensionToolC
 		model: parent,
 		thinkingLevel: "medium",
 		modelRegistry: registry,
-		sessionManager: { getSessionId: () => "model-search-test-session" },
+		sessionManager: { getSessionId: () => "model-search-test-session", getBranch: () => branch },
 	} as unknown as ExtensionToolContext;
 }
 
-function registerSearch(parent: Model<Api>, models: Model<Api>[]) {
+function registerSearch(parent: Model<Api>, models: Model<Api>[], branch: unknown[] = []) {
 	const hooks = new Map<string, Hook>();
 	let tool: ToolDefinition | undefined;
 	const pi = {
@@ -97,7 +102,7 @@ function registerSearch(parent: Model<Api>, models: Model<Api>[]) {
 	const dispatch = createSubagentDispatch(pi);
 	registerModelSearch(pi, dispatch);
 	if (!tool) throw new Error("search_models was not registered");
-	const ctx = createContext(parent, models);
+	const ctx = createContext(parent, models, branch);
 	return { tool, ctx, hooks };
 }
 
@@ -300,9 +305,9 @@ describe("search_models", () => {
 		expect(explicitResult.models.map((entry) => entry.id)).toEqual(["other-provider/explicit-model"]);
 	});
 
-	it("uses the observed current serving account for a pool and rejects unknown pool affinity", async () => {
+	it("uses the observed current serving account for a broker pool and rejects unknown pool affinity", async () => {
 		const serving = model("served-model", { provider: "acct:serving-account" });
-		const poolModel = model("served-model", { provider: "pool:claude" });
+		const poolModel = model("served-model", { provider: "pool:codex" });
 		writeFileSync(
 			join(agentDir, "accounts", "catalog.json"),
 			JSON.stringify({
@@ -311,14 +316,46 @@ describe("search_models", () => {
 				pools: [],
 			}),
 		);
-		const registered = registerSearch(model("parent", { provider: "pool:claude" }), [poolModel, serving]);
+		const registered = registerSearch(model("parent", { provider: "pool:codex" }), [poolModel, serving]);
 		await establishPoolAccount(registered, "serving-key");
 
 		const current = output(await search(registered));
 		expect(current.provider).toBe("acct:serving-account");
 		expect(current.models.map((entry) => entry.id)).toEqual(["acct:serving-account/served-model"]);
 
-		const unknown = registerSearch(model("parent", { provider: "pool:claude" }), [poolModel, serving]);
+		const unknown = registerSearch(model("parent", { provider: "pool:codex" }), [poolModel, serving]);
 		await expect(search(unknown)).rejects.toThrow(/serving account is unknown/i);
+	});
+
+	it("uses the account that answered last for a virtual pool, which picks its account per request", async () => {
+		const local = model("served-model", { provider: "claude-sub:1a2b3c4d" });
+		const other = model("served-model", { provider: "claude-sub:5e6f7a8b" });
+		const broker = model("served-model", { provider: "acct:api-account" });
+		const models = [model("served-model", { provider: "pool:claude" }), local, other, broker];
+		const parent = (provider: string) => model("served-model", { provider });
+
+		for (const [pool, served, expected] of [
+			["pool:claude", "claude-sub:1a2b3c4d", "claude-sub:1a2b3c4d"],
+			["pool:all", "acct:api-account", "acct:api-account"],
+		]) {
+			// Failed and aborted answers name an account that did not serve; the latest success wins.
+			const branch = [answer("claude-sub:5e6f7a8b"), answer(served), answer("claude-sub:5e6f7a8b", "error")];
+			const result = output(await search(registerSearch(parent(pool), models, branch)));
+			expect(result.provider).toBe(expected);
+			expect(result.models.map((entry) => entry.id)).toEqual([`${expected}/served-model`]);
+		}
+
+		// Before the first answer, or when the last answer came from a provider outside the accounts, nothing tells.
+		await expect(search(registerSearch(parent("pool:claude"), models, []))).rejects.toThrow(
+			/serving account is unknown/i,
+		);
+		await expect(search(registerSearch(parent("pool:claude"), models, [answer("anthropic")]))).rejects.toThrow(
+			/serving account is unknown/i,
+		);
+		// An explicit provider still opts out of the pool.
+		const explicit = output(
+			await search(registerSearch(parent("pool:claude"), models, []), { provider: "acct:api-account" }),
+		);
+		expect(explicit.provider).toBe("acct:api-account");
 	});
 });

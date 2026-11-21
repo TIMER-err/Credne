@@ -11,6 +11,9 @@
     "lastChangelogVersion": {
       "type": "string"
     },
+    "lastUpdateNotificationVersion": {
+      "type": "string"
+    },
     "extensionChangelogVersions": {
       "type": "object",
       "patternProperties": {
@@ -699,6 +702,33 @@
         }
       ],
       "description": "WebSocket connect or open handshake timeout in milliseconds; 0 or \"disabled\" disables it."
+    },
+    "sidePanel": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Show the diff side panel. Global only; restored across sessions and application launches.",
+          "default": false
+        },
+        "width": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[1-9][0-9]?(?:\\.[0-9]+)?%$"
+            },
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991,
+              "deprecated": true,
+              "description": "Legacy width in columns. Converted to a percentage when the panel is shown."
+            }
+          ],
+          "description": "Share of terminal width, clamped to 25–60%. Global only.",
+          "default": "40%"
+        }
+      }
     },
     "tuiMode": {
       "anyOf": [

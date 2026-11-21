@@ -5,11 +5,18 @@
 // While open, git refreshes after agent_end and tool_execution_end (debounced), then loads the files' diffs one
 // process step at a time. Selection prioritizes pending files. Rendering never starts git work.
 import type { Component, OverlayHandle, OverlayOptions, TUI } from "@earendil-works/pi-tui";
+import type { SettingsManager } from "../../core/settings-manager.ts";
 import { type ChangedFile, type ChangesSnapshot, loadChanges, loadFileDiff } from "./components/git-changes.ts";
 import { type GitRunner, runGit } from "./components/git-runner.ts";
-import { captureBaseline, type SessionBaseline } from "./components/session-baseline.ts";
+import type { SessionBaseline } from "./components/session-baseline.ts";
 import { SidePanel, type SidePanelSection } from "./components/side-panel.ts";
-import { sidePanelMinColumns, sidePanelWidthFor, type TranscriptReservation } from "./components/side-panel-layout.ts";
+import {
+	sidePanelMinColumns,
+	sidePanelPercentFor,
+	sidePanelWidthFor,
+	type TranscriptReservation,
+} from "./components/side-panel-layout.ts";
+import { loadSessionBaseline, type SidePanelSession } from "./side-panel-persistence.ts";
 import { type Theme, theme } from "./theme/theme.ts";
 
 export type SidePanelSectionComponent = Component & { dispose?(): void };
@@ -18,8 +25,12 @@ export type SidePanelSectionFactory = (tui: TUI, theme: Theme) => SidePanelSecti
 export interface SidePanelHost {
 	/** Stable reference that follows renderer replacement. */
 	readonly ui: TUI;
-	/** Working directory whose git changes the panel shows. */
-	getCwd(): string;
+	/** The active session whose baseline is restored or captured. */
+	getSessionManager(): SidePanelSession;
+	getSettingsManager(): Pick<
+		SettingsManager,
+		"getSidePanelEnabled" | "setSidePanelEnabled" | "getSidePanelWidth" | "setSidePanelWidthPercent"
+	>;
 	/** What closes the panel, for the header: the configured toggle key, or "/diff". */
 	getCloseHint(): string;
 	showStatus(message: string): void;
@@ -42,44 +53,78 @@ export class SidePanelController {
 	private snapshot: ChangesSnapshot | undefined;
 	/** The repository state the session started from, being captured or captured. */
 	private baseline: Promise<SessionBaseline> | undefined;
+	private sessionGeneration = 0;
 	private refreshTimer: NodeJS.Timeout | undefined;
 	private isPumping = false;
 	private isChangesRequested = false;
 	private isDiffRequested = false;
 	private pendingDiffs: ChangedFile[] = [];
-	private requestedWidth: number | undefined;
+	private widthPercent: number | undefined;
+	private legacyWidthColumns: number | undefined;
 	/** The git step in flight, so close() and a new file selection can stop it. */
 	private step: { kind: "changes" | "diff"; abort: AbortController } | undefined;
 
 	constructor(host: SidePanelHost, run: GitRunner = runGit) {
 		this.host = host;
 		this.runGit = run;
+		const width = host.getSettingsManager().getSidePanelWidth();
+		if (width?.unit === "percent") this.widthPercent = width.value;
+		else this.legacyWidthColumns = width?.value;
 	}
 
 	get isOpen(): boolean {
-		return this.panel !== undefined;
+		return this.panel !== undefined && this.host.ui.terminal.columns >= sidePanelMinColumns;
 	}
 
 	toggle(): void {
-		if (this.isOpen) this.close();
+		if (this.panel) this.close();
 		else this.open();
 	}
 
 	open(): void {
 		if (this.panel) return;
-		const ui = this.host.ui;
-		if (sidePanelWidthFor(ui.terminal.columns) === 0) {
+		if (this.host.ui.terminal.columns < sidePanelMinColumns) {
 			this.host.showStatus(`The side panel needs a terminal at least ${sidePanelMinColumns} columns wide`);
 			return;
 		}
-		const getWidth = () => sidePanelWidthFor(ui.terminal.columns, this.requestedWidth);
+		this.host.getSettingsManager().setSidePanelEnabled(true);
+		this.mountPanel();
+	}
+
+	private mountPanel(): void {
+		if (this.panel) return;
+		const ui = this.host.ui;
+		let dragPercent: number | undefined;
+		const getWidth = () => {
+			const columns = ui.terminal.columns;
+			// A restored panel can be hidden at startup. Convert against the first width it can actually use.
+			if (this.legacyWidthColumns !== undefined && columns >= sidePanelMinColumns) {
+				this.widthPercent = sidePanelPercentFor(columns, this.legacyWidthColumns);
+				this.legacyWidthColumns = undefined;
+				this.host.getSettingsManager().setSidePanelWidthPercent(this.widthPercent);
+			}
+			return sidePanelWidthFor(columns, dragPercent ?? this.widthPercent);
+		};
 		const reservation = this.host.reserveTranscriptColumns(getWidth);
 		const panel = new SidePanel({
 			getHeight: () => reservation.getRows(),
 			getCloseHint: () => this.host.getCloseHint(),
-			resize: (screenX) => {
-				this.requestedWidth = sidePanelWidthFor(ui.terminal.columns, ui.terminal.columns - screenX);
-				ui.requestRender();
+			resize: (screenX, phase) => {
+				const columns = ui.terminal.columns;
+				if (columns < sidePanelMinColumns) {
+					dragPercent = undefined;
+					return;
+				}
+				const percent = sidePanelPercentFor(columns, columns - screenX);
+				if (phase === "drag") {
+					dragPercent = percent;
+				} else {
+					dragPercent = undefined;
+					if (sidePanelWidthFor(columns, percent) !== sidePanelWidthFor(columns, this.widthPercent)) {
+						this.widthPercent = percent;
+						this.host.getSettingsManager().setSidePanelWidthPercent(percent);
+					}
+				}
 			},
 		});
 		panel.setSections([...this.sections.values()]);
@@ -91,6 +136,12 @@ export class SidePanelController {
 	}
 
 	close(): void {
+		this.host.getSettingsManager().setSidePanelEnabled(false);
+		this.stop();
+	}
+
+	/** Tear down the panel without changing the preference saved by the user's toggle. */
+	stop(): void {
 		if (!this.panel) return;
 		clearTimeout(this.refreshTimer);
 		this.step?.abort.abort();
@@ -109,8 +160,8 @@ export class SidePanelController {
 	/** Close the panel before a renderer swap. The returned function opens it again on the new renderer. */
 	suspend(): () => void {
 		if (!this.panel) return () => {};
-		this.close();
-		return () => this.open();
+		this.stop();
+		return () => this.mountPanel();
 	}
 
 	/** Add, replace or remove a section. A section is created once, here, and disposed when replaced or removed. */
@@ -127,13 +178,22 @@ export class SidePanelController {
 		this.refreshSections();
 	}
 
-	/**
-	 * Capture the repository state that a new session starts from, in the background. The panel shows the changes since.
-	 * Call it when a session becomes active, at startup and on every session switch.
-	 */
+	/** Restore or capture this session's starting state, then restore the global visibility preference. */
 	beginSession(): void {
-		this.baseline = captureBaseline(this.host.getCwd(), this.runGit);
-		this.scheduleRefresh();
+		this.stop();
+		this.baseline = this.loadBaseline();
+		if (this.host.getSettingsManager().getSidePanelEnabled()) this.mountPanel();
+	}
+
+	private loadBaseline(): Promise<SessionBaseline> {
+		const generation = ++this.sessionGeneration;
+		const session = this.host.getSessionManager();
+		const sessionId = session.getSessionId();
+		return loadSessionBaseline(
+			session,
+			() => generation === this.sessionGeneration && this.host.getSessionManager().getSessionId() === sessionId,
+			this.runGit,
+		);
 	}
 
 	/** Reload the changes soon, merging bursts of calls. Does nothing while the panel is closed. */
@@ -197,8 +257,9 @@ export class SidePanelController {
 		const load = new AbortController();
 		this.step = { kind: "changes", abort: load };
 		// A panel opened before the baseline is captured waits for it.
-		this.baseline ??= captureBaseline(this.host.getCwd(), this.runGit);
-		const snapshot = await loadChanges(await this.baseline, load.signal, this.runGit);
+		this.baseline ??= this.loadBaseline();
+		const baseline = await this.baseline;
+		const snapshot = load.signal.aborted ? undefined : await loadChanges(baseline, load.signal, this.runGit);
 		if (this.step?.abort === load) this.step = undefined;
 		// close() aborted this load, or the panel was closed and opened again: drop the result.
 		if (snapshot === undefined || load.signal.aborted || this.panel !== panel) return;

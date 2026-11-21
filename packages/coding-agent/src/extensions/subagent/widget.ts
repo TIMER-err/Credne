@@ -286,25 +286,23 @@ export class SubagentWidget implements Component, Focusable {
 }
 
 /**
- * The Agents section of the side panel: every worker, but only when the widget below the input box
- * hides some. It has no timer or subscription of its own: the widget's subscription already
- * requests renders and the widget's spinner supplies the frames.
+ * Every worker in the sidebar's Agents viewport. The widget's subscription requests renders
+ * and the widget's spinner supplies the frames.
  */
 export class SubagentSection implements Component {
+	readonly stickyHeader = true;
 	private readonly team: Pick<WorkerTeam, "count" | "getViews">;
-	private readonly tui: TUI;
 	private readonly theme: Theme;
 	private readonly spinner: WorkerSpinner;
 
-	constructor(team: Pick<WorkerTeam, "count" | "getViews">, tui: TUI, theme: Theme, spinner: WorkerSpinner) {
+	constructor(team: Pick<WorkerTeam, "count" | "getViews">, _tui: TUI, theme: Theme, spinner: WorkerSpinner) {
 		this.team = team;
-		this.tui = tui;
 		this.theme = theme;
 		this.spinner = spinner;
 	}
 
 	render(width: number): string[] {
-		if (!hasHiddenWorkers(this.team.count(), this.tui.terminal.rows)) return [];
+		if (!this.team.count()) return [];
 		const workers = this.team.getViews();
 		const frame = this.spinner.frame();
 		return [

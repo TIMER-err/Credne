@@ -162,35 +162,43 @@ function codexToken(): string {
 
 afterEach(() => vi.unstubAllEnvs());
 
+// Only the account broker understands `prompt_cache_options`; Anthropic rejects it. Local subscriptions and the
+// virtual pools, which route to local subscriptions or broker accounts, never send it.
+const brokerProviders = new Set(["acct:work", "pool:codex"]);
+const cacheOptionsOf = (provider: string) => (brokerProviders.has(provider) ? { mode: "explicit" } : undefined);
+
 describe("worker Anthropic cache payloads", () => {
-	it.each(["anthropic", "acct:work", "pool:claude"])("marks both reusable boundaries through %s", async (provider) => {
-		const selected = model("anthropic-messages", provider);
-		const child = worker(selected);
-		const wire = transport(selected.api);
-		const result = await anthropicStream(selected, context(), {
-			apiKey: "test-key",
-			sessionId: "unique-worker-session",
-			fetch: wire.fetch,
-			onPayload: child.payload,
-			onProviderStreamEvent: child.event,
-			maxRetries: 0,
-		}).result();
-		const payload = wire.captured[0].body;
-		expect(result.stopReason, result.errorMessage).toBe("stop");
-		expect(payload.system?.at(-1)).toEqual({
-			type: "text",
-			text: "Worker instructions.\n<cwd>project</cwd>",
-			cache_control: { type: "ephemeral" },
-		});
-		expect(payload.messages?.[0].content).toEqual([
-			{ type: "text", text: reference, cache_control: { type: "ephemeral" } },
-			{ type: "text", text: "Implement the endpoint.", cache_control: { type: "ephemeral" } },
-		]);
-		expect(payload.tools?.[0].cache_control).toBeUndefined();
-		expect(payload.prompt_cache_options).toEqual(provider === "anthropic" ? undefined : { mode: "explicit" });
-		expect(child.requests.map((request) => request.type)).toEqual(["cache_wait", "cache_ready"]);
-		expect(result.usage).toMatchObject({ input: 10, cacheRead: 90, cacheWrite: 0, totalTokens: 102 });
-	});
+	it.each(["anthropic", "claude-sub:1a2b3c4d", "pool:claude", "pool:all", "acct:work", "pool:codex"])(
+		"marks both reusable boundaries through %s",
+		async (provider) => {
+			const selected = model("anthropic-messages", provider);
+			const child = worker(selected);
+			const wire = transport(selected.api);
+			const result = await anthropicStream(selected, context(), {
+				apiKey: "test-key",
+				sessionId: "unique-worker-session",
+				fetch: wire.fetch,
+				onPayload: child.payload,
+				onProviderStreamEvent: child.event,
+				maxRetries: 0,
+			}).result();
+			const payload = wire.captured[0].body;
+			expect(result.stopReason, result.errorMessage).toBe("stop");
+			expect(payload.system?.at(-1)).toEqual({
+				type: "text",
+				text: "Worker instructions.\n<cwd>project</cwd>",
+				cache_control: { type: "ephemeral" },
+			});
+			expect(payload.messages?.[0].content).toEqual([
+				{ type: "text", text: reference, cache_control: { type: "ephemeral" } },
+				{ type: "text", text: "Implement the endpoint.", cache_control: { type: "ephemeral" } },
+			]);
+			expect(payload.tools?.[0].cache_control).toBeUndefined();
+			expect(payload.prompt_cache_options).toEqual(cacheOptionsOf(provider));
+			expect(child.requests.map((request) => request.type)).toEqual(["cache_wait", "cache_ready"]);
+			expect(result.usage).toMatchObject({ input: 10, cacheRead: 90, cacheWrite: 0, totalTokens: 102 });
+		},
+	);
 
 	it("keeps OAuth identity text and makes room for the conversation and automatic marker", async () => {
 		const selected = model("anthropic-messages", "anthropic");
@@ -213,23 +221,24 @@ describe("worker Anthropic cache payloads", () => {
 		expect(JSON.stringify(payload).match(/"cache_control":/g)).toHaveLength(4);
 	});
 
-	it.each(["anthropic", "acct:work"])("honors cacheRetention none through %s", async (provider) => {
-		const selected = model("anthropic-messages", provider);
-		const child = worker(selected);
-		const wire = transport(selected.api);
-		await anthropicStream(selected, context(), {
-			apiKey: "key",
-			cacheRetention: "none",
-			fetch: wire.fetch,
-			onPayload: child.payload,
-			maxRetries: 0,
-		}).result();
-		expect(JSON.stringify(wire.captured[0].body)).not.toContain('"cache_control"');
-		expect(wire.captured[0].body.prompt_cache_options).toEqual(
-			provider === "anthropic" ? undefined : { mode: "explicit" },
-		);
-		expect(child.requests).toHaveLength(0);
-	});
+	it.each(["anthropic", "claude-sub:1a2b3c4d", "acct:work"])(
+		"honors cacheRetention none through %s",
+		async (provider) => {
+			const selected = model("anthropic-messages", provider);
+			const child = worker(selected);
+			const wire = transport(selected.api);
+			await anthropicStream(selected, context(), {
+				apiKey: "key",
+				cacheRetention: "none",
+				fetch: wire.fetch,
+				onPayload: child.payload,
+				maxRetries: 0,
+			}).result();
+			expect(JSON.stringify(wire.captured[0].body)).not.toContain('"cache_control"');
+			expect(wire.captured[0].body.prompt_cache_options).toEqual(cacheOptionsOf(provider));
+			expect(child.requests).toHaveLength(0);
+		},
+	);
 
 	it("keeps the reference checkpoint on later growing requests", async () => {
 		const selected = model("anthropic-messages");

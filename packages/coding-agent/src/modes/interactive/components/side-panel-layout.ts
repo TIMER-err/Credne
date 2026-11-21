@@ -4,20 +4,28 @@
 // width, and the panel stops above it. Nothing here exists while the panel is closed: both reservations are
 // installed on open and removed on close.
 import { type Component, Container, type TUI } from "@earendil-works/pi-tui";
+import { SETTINGS_DEFAULTS } from "../../../core/settings-defaults.ts";
 import type { ChatViewport } from "../chat-viewport.ts";
 
 /** Terminals narrower than this cannot show the panel next to the transcript. */
-export const sidePanelMinColumns = 100;
+export const sidePanelMinColumns = 80;
 
-const sidePanelMinWidth = 40;
-const sidePanelMaxWidth = 90;
-const sidePanelWidthShare = 0.4;
+const sidePanelMinPercent = 25;
+const sidePanelMaxPercent = 60;
 
-/** Resolve the default or dragged width, leaving at least 40 columns for each pane. */
-export function sidePanelWidthFor(columns: number, requestedWidth?: number): number {
+/** Resolve the sidebar's columns, keeping at least 40% of the terminal for the transcript. */
+export function sidePanelWidthFor(columns: number, percent: number = SETTINGS_DEFAULTS.sidePanel.widthPercent): number {
 	if (columns < sidePanelMinColumns) return 0;
-	const desired = requestedWidth ?? Math.min(sidePanelMaxWidth, Math.floor(columns * sidePanelWidthShare));
-	return Math.max(sidePanelMinWidth, Math.min(columns - sidePanelMinWidth, desired));
+	return Math.round((columns * clampSidePanelPercent(percent)) / 100);
+}
+
+/** Convert a divider position or legacy column setting to a share of the current terminal. */
+export function sidePanelPercentFor(columns: number, width: number): number {
+	return clampSidePanelPercent(Math.round((width / columns) * 10000) / 100);
+}
+
+function clampSidePanelPercent(percent: number): number {
+	return Math.max(sidePanelMinPercent, Math.min(sidePanelMaxPercent, percent));
 }
 
 /** Columns reserved beside the transcript. */

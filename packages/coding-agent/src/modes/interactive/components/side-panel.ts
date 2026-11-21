@@ -16,7 +16,17 @@ export interface SidePanelSection {
 	key: string;
 	/** Sections render top to bottom by ascending order. */
 	order: number;
-	component: Component;
+	component: Component & {
+		/** Keep the first rendered row fixed when the section has room for more than one row. */
+		readonly stickyHeader?: boolean;
+	};
+}
+
+interface SectionViewport extends SidePanelSection {
+	offset: number;
+	start: number;
+	rows: number;
+	maxOffset: number;
 }
 
 /** A file's diff, loading until the controller delivers it. */
@@ -27,7 +37,7 @@ export interface SidePanelOptions {
 	getHeight: () => number;
 	/** What closes the panel, shown in the header: the toggle key, or "/diff". */
 	getCloseHint: () => string;
-	resize?: (screenX: number) => void;
+	resize?: (screenX: number, phase: "drag" | "release") => void;
 }
 
 const maxFileRows = 8;
@@ -59,7 +69,7 @@ interface DiffBlock {
  */
 export class SidePanel implements Component {
 	private readonly options: SidePanelOptions;
-	private sections: SidePanelSection[] = [];
+	private sections: SectionViewport[] = [];
 	private changes: ChangesSnapshot | undefined;
 	private selectedIndex = 0;
 	private fileOffset = 0;
@@ -72,15 +82,20 @@ export class SidePanel implements Component {
 	private fileRegionEnd = 0;
 	private fileRowIndices = new Map<number, number>();
 	private followSelection = true;
-	private sectionOffset = 0;
-	private sectionViewRows = 0;
-	private sectionRowCount = 0;
+	private sectionRows = 0;
 	private isResizing = false;
+	/** Keep the hovered screen row, so scrolling the index highlights the file now under the pointer. */
+	private hoveredFileRow: number | undefined;
+	private isSeparatorHovered = false;
 	/** Bumped by every change to what the changes part shows. */
 	private revision = 0;
-	private sectionCache: { width: number; rows: number; offset: number; raw: string[]; lines: string[] } | undefined;
-	private changesCache: { revision: number; width: number; rows: number; hint: string; lines: string[] } | undefined;
-	private outputCache: { sectionLines: string[]; changesLines: string[]; height: number; lines: string[] } | undefined;
+	private sectionCache: { width: number; raw: string[]; lines: string[] } | undefined;
+	private changesCache:
+		| { revision: number; width: number; rows: number; start: number; hint: string; lines: string[] }
+		| undefined;
+	private outputCache:
+		| { sectionLines: string[]; changesLines: string[]; height: number; separatorActive: boolean; lines: string[] }
+		| undefined;
 	private diffRowCacheWidth = 0;
 
 	constructor(options: SidePanelOptions) {
@@ -89,7 +104,10 @@ export class SidePanel implements Component {
 
 	/** Replace the extension sections. They render above the changes, by ascending order. */
 	setSections(sections: readonly SidePanelSection[]): void {
-		this.sections = [...sections].sort((a, b) => a.order - b.order);
+		const offsets = new Map(this.sections.map((section) => [section.key, section.offset]));
+		this.sections = sections
+			.map((section) => ({ ...section, offset: offsets.get(section.key) ?? 0, start: 0, rows: 0, maxOffset: 0 }))
+			.sort((a, b) => a.order - b.order);
 	}
 
 	/** Show a new snapshot, keeping the selection on the same file when it is still changed. */
@@ -174,13 +192,23 @@ export class SidePanel implements Component {
 	}
 
 	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+		if (event.type === "move" || event.type === "leave") {
+			const changed = this.updateHover(event);
+			return changed || this.hoveredFileRow !== undefined || this.isSeparatorHovered
+				? { handled: true, render: changed }
+				: undefined;
+		}
 		if (event.type === "press" && event.button === "left" && event.x === 0 && this.options.resize) {
+			this.updateHover(event);
 			this.isResizing = true;
-			return { handled: true, capture: true };
+			return { handled: true, capture: true, render: true };
 		}
 		if (this.isResizing && (event.type === "drag" || event.type === "release")) {
-			this.options.resize?.(event.screenX);
-			if (event.type === "release") this.isResizing = false;
+			this.options.resize?.(event.screenX, event.type);
+			if (event.type === "release") {
+				this.isResizing = false;
+				this.updateHover(event);
+			}
 			return { handled: true, render: true };
 		}
 		if (event.type === "press" && event.button === "left" && this.fileRowIndices.has(event.y)) {
@@ -196,11 +224,9 @@ export class SidePanel implements Component {
 			return { handled: true };
 		}
 		if (event.type !== "wheel" || event.wheelDelta === undefined) return undefined;
-		if (event.y < this.sectionViewRows) {
-			this.sectionOffset = Math.max(
-				0,
-				Math.min(this.sectionOffset + event.wheelDelta, this.sectionRowCount - this.sectionViewRows),
-			);
+		if (event.y < this.sectionRows) {
+			const section = this.sections.find(({ start, rows }) => event.y >= start && event.y < start + rows);
+			if (section) section.offset = Math.max(0, Math.min(section.offset + event.wheelDelta, section.maxOffset));
 		} else if (event.y >= this.fileRegionStart && event.y < this.fileRegionEnd) {
 			this.fileOffset = Math.max(
 				0,
@@ -224,17 +250,38 @@ export class SidePanel implements Component {
 	render(width: number): string[] {
 		const height = Math.max(1, this.options.getHeight());
 		const bodyWidth = Math.max(0, width - 1);
-		const sectionLines = this.renderSections(bodyWidth, Math.floor(height / 3));
-		const changesLines = this.renderChanges(bodyWidth, Math.max(0, height - sectionLines.length));
+		const sectionLines = this.renderSections(bodyWidth, height);
+		this.sectionRows = sectionLines.length;
+		const changesLines = this.renderChanges(bodyWidth, height - this.sectionRows);
+		const separatorActive = this.isSeparatorHovered || this.isResizing;
 		const cached = this.outputCache;
-		if (cached?.sectionLines === sectionLines && cached.changesLines === changesLines && cached.height === height) {
+		if (
+			cached?.sectionLines === sectionLines &&
+			cached.changesLines === changesLines &&
+			cached.height === height &&
+			cached.separatorActive === separatorActive
+		) {
 			return cached.lines;
 		}
-		const lines = [...sectionLines, ...changesLines].slice(0, height);
-		const blank = frame(exactWidth("", bodyWidth));
+		const border = separatorActive ? theme.inverse(theme.fg("borderAccent", "┃")) : theme.fg("borderAccent", "│");
+		const lines = [...sectionLines, ...changesLines].slice(0, height).map((line) => border + line);
+		const blank = border + exactWidth("", bodyWidth);
 		while (lines.length < height) lines.push(blank);
-		this.outputCache = { sectionLines, changesLines, height, lines };
+		this.outputCache = { sectionLines, changesLines, height, separatorActive, lines };
 		return lines;
+	}
+
+	private updateHover(event: TuiMouseEvent): boolean {
+		const inside =
+			event.type !== "leave" && event.x >= 0 && event.x < event.width && event.y >= 0 && event.y < event.height;
+		const hoveredFileRow = inside && event.x > 0 && this.fileRowIndices.has(event.y) ? event.y : undefined;
+		const separatorHovered = inside && event.x === 0 && this.options.resize !== undefined;
+		const fileChanged = hoveredFileRow !== this.hoveredFileRow;
+		const changed = fileChanged || separatorHovered !== this.isSeparatorHovered;
+		this.hoveredFileRow = hoveredFileRow;
+		this.isSeparatorHovered = separatorHovered;
+		if (fileChanged) this.revision++;
+		return changed;
 	}
 
 	private files(): readonly ChangedFile[] {
@@ -259,34 +306,53 @@ export class SidePanel implements Component {
 		return Math.max(lastStart, this.diffRowCount - this.diffViewRows, 0);
 	}
 
-	/** The sections' lines, framed. The sections render every frame, so they are the only part compared by content. */
-	private renderSections(bodyWidth: number, rows: number): string[] {
-		const blocks = this.sections
-			.map((section) => section.component.render(Math.max(1, bodyWidth - 2)))
-			.filter((block) => block.length > 0);
-		const raw = blocks.flatMap((block, index) => (index === 0 ? block : ["", ...block]));
-		if (raw.length > 0) raw.push("");
-		this.sectionRowCount = raw.length;
-		this.sectionViewRows = Math.min(rows, raw.length);
-		this.sectionOffset = Math.min(this.sectionOffset, Math.max(0, raw.length - this.sectionViewRows));
+	/** Split the available rows among the nonempty sections without letting a long list hide the others. */
+	private renderSections(bodyWidth: number, height: number): string[] {
+		const blocks = this.sections.flatMap((section) => {
+			section.rows = 0;
+			const lines = section.component.render(Math.max(1, bodyWidth - 2));
+			return lines.length > 0 ? [{ section, lines }] : [];
+		});
+		if (!blocks.length) return noLines;
+
+		// Give sections roughly a third of the height, with two rows each on shorter screens if changes still fit.
+		const sectionTarget = Math.max(Math.floor(height / 3), blocks.length * 2);
+		const changesMin = Math.min(6, Math.max(height <= 3 ? 1 : 2, height - blocks.length * 2));
+		let remaining = Math.min(sectionTarget, height - changesMin);
+		for (let row = 0; remaining > 0; row++) {
+			const before = remaining;
+			for (const { section, lines } of blocks) {
+				if (row >= lines.length) continue;
+				section.rows++;
+				if (--remaining === 0) break;
+			}
+			if (remaining === before) break;
+		}
+
+		const raw: string[] = [];
+		for (const { section, lines } of blocks) {
+			if (section.rows === 0) continue;
+			section.start = raw.length;
+			section.maxOffset = lines.length - section.rows;
+			section.offset = Math.min(section.offset, section.maxOffset);
+			// A one-row viewport still lets the user reach list items instead of pinning the header over them.
+			const headerRows = section.component.stickyHeader && section.rows > 1 ? 1 : 0;
+			if (headerRows) raw.push(lines[0]!);
+			raw.push(...lines.slice(section.offset + headerRows, section.offset + section.rows));
+			if (remaining > 0) {
+				raw.push("");
+				remaining--;
+			}
+		}
 		if (raw.length === 0) return noLines;
 		const cached = this.sectionCache;
-		if (
-			cached &&
-			cached.width === bodyWidth &&
-			cached.rows === rows &&
-			cached.offset === this.sectionOffset &&
-			sameLines(cached.raw, raw)
-		)
-			return cached.lines;
-		const lines = raw
-			.slice(this.sectionOffset, this.sectionOffset + rows)
-			.map((line) => frame(padded(line, bodyWidth)));
-		this.sectionCache = { width: bodyWidth, rows, offset: this.sectionOffset, raw, lines };
+		if (cached?.width === bodyWidth && sameLines(cached.raw, raw)) return cached.lines;
+		const lines = raw.map((line) => padded(line, bodyWidth));
+		this.sectionCache = { width: bodyWidth, raw, lines };
 		return lines;
 	}
 
-	/** The changes part in `rows` rows, framed, rebuilt only when its data, width, height or hint changed. */
+	/** The changes part in `rows` rows, rebuilt only when its data, hover, width, height or hint changed. */
 	private renderChanges(bodyWidth: number, rows: number): string[] {
 		const hint = this.options.getCloseHint();
 		const cached = this.changesCache;
@@ -294,12 +360,13 @@ export class SidePanel implements Component {
 			cached?.revision === this.revision &&
 			cached.width === bodyWidth &&
 			cached.rows === rows &&
+			cached.start === this.sectionRows &&
 			cached.hint === hint
 		) {
 			return cached.lines;
 		}
-		const lines = this.buildChanges(bodyWidth, rows, hint).map(frame);
-		this.changesCache = { revision: this.revision, width: bodyWidth, rows, hint, lines };
+		const lines = this.buildChanges(bodyWidth, rows, hint);
+		this.changesCache = { revision: this.revision, width: bodyWidth, rows, start: this.sectionRows, hint, lines };
 		return lines;
 	}
 
@@ -307,7 +374,8 @@ export class SidePanel implements Component {
 	private buildChanges(bodyWidth: number, available: number, hint: string): string[] {
 		const changes = this.changes;
 		this.fileRowIndices.clear();
-		this.fileRegionStart = this.sectionViewRows + 2;
+		const compact = available < framingRows + overflowRows + minDiffRows + 1;
+		this.fileRegionStart = this.sectionRows + (compact ? 1 : 2);
 		this.fileRegionEnd = this.fileRegionStart;
 		if (changes === undefined) return [headerRow([muted("Loading changes…")], hint, bodyWidth)];
 		if (changes.status === "no-repo") return [headerRow([muted("Not a git repository")], hint, bodyWidth)];
@@ -316,21 +384,18 @@ export class SidePanel implements Component {
 			return [headerRow([muted(`No changes ${scopeLabel(changes.scope)}`), muted("No changes")], hint, bodyWidth)];
 		}
 
-		const listRows = Math.max(
-			1,
-			Math.min(maxFileRows, changes.files.length, available - framingRows - overflowRows - minDiffRows),
-		);
+		const listRows = compact
+			? Math.min(changes.files.length, available >= 3 ? 1 : 0)
+			: Math.min(maxFileRows, changes.files.length, available - framingRows - overflowRows - minDiffRows);
 		const omitted = changes.totals.files - changes.files.length;
-		const fileLines = this.buildFileList(changes.files, listRows, omitted, bodyWidth);
+		const fileLines = listRows > 0 ? this.buildFileList(changes.files, listRows, omitted, bodyWidth, compact) : [];
 		this.fileRegionEnd = this.fileRegionStart + fileLines.length;
-		const blank = exactWidth("", bodyWidth);
-		return [
-			headerRow(summaryTexts(changes.totals, changes.scope), hint, bodyWidth),
-			blank,
-			...fileLines,
-			blank,
-			...this.buildDiff(Math.max(0, available - framingRows - fileLines.length), bodyWidth),
-		];
+		const lines = [headerRow(summaryTexts(changes.totals, changes.scope), hint, bodyWidth)];
+		if (!compact) lines.push(exactWidth("", bodyWidth));
+		lines.push(...fileLines);
+		if (!compact) lines.push(exactWidth("", bodyWidth));
+		lines.push(...this.buildDiff(available - lines.length, bodyWidth));
+		return lines;
 	}
 
 	private buildFileList(
@@ -338,6 +403,7 @@ export class SidePanel implements Component {
 		listRows: number,
 		omitted: number,
 		bodyWidth: number,
+		compact: boolean,
 	): string[] {
 		this.fileViewRows = listRows;
 		if (this.followSelection) {
@@ -349,13 +415,15 @@ export class SidePanel implements Component {
 		const above = this.fileOffset;
 		const below = files.length - this.fileOffset - listRows;
 		const lines: string[] = [];
-		const overflows = files.length > listRows;
+		const overflows = !compact && files.length > listRows;
 		if (overflows) lines.push(padded(muted(above > 0 ? `↑ ${above} more above` : ""), bodyWidth));
 		for (let index = this.fileOffset; index < this.fileOffset + listRows; index++) {
-			this.fileRowIndices.set(this.fileRegionStart + lines.length, index);
-			lines.push(fileRow(files[index]!, index === this.selectedIndex, bodyWidth));
+			const row = this.fileRegionStart + lines.length;
+			this.fileRowIndices.set(row, index);
+			const state = this.hoveredFileRow === row ? "hovered" : index === this.selectedIndex ? "selected" : "normal";
+			lines.push(fileRow(files[index]!, state, bodyWidth));
 		}
-		if (overflows || omitted > 0) {
+		if (!compact && (overflows || omitted > 0)) {
 			const notes = [
 				below > 0 ? `↓ ${below} more below` : "",
 				omitted > 0 ? `+${omitted} more not listed` : "",
@@ -392,7 +460,7 @@ export class SidePanel implements Component {
 		if (index === 0 || index === 2) {
 			line = theme.fg("borderMuted", "─".repeat(bodyWidth));
 		} else if (index === 1) {
-			line = fileRow(block.file, false, bodyWidth);
+			line = fileRow(block.file, "normal", bodyWidth);
 		} else if (index === block.length - 1) {
 			line = exactWidth("", bodyWidth);
 		} else if (block.diff.status !== "ready") {
@@ -424,11 +492,6 @@ export class SidePanel implements Component {
 		if (row.kind === "removed") return fillBackground(line, bodyWidth, "toolErrorBg");
 		return line;
 	}
-}
-
-/** The panel's left border, then the body line. */
-function frame(body: string): string {
-	return theme.fg("borderAccent", "│") + body;
 }
 
 function sameLines(a: readonly string[], b: readonly string[]): boolean {
@@ -470,12 +533,18 @@ function headerRow(lefts: readonly string[], closeHint: string, bodyWidth: numbe
 	return padded(left === undefined ? lefts[lefts.length - 1]! : joinSides(left, hint, room), bodyWidth);
 }
 
-function fileRow(file: ChangedFile, isSelected: boolean, bodyWidth: number): string {
+function fileRow(file: ChangedFile, state: "normal" | "selected" | "hovered", bodyWidth: number): string {
 	const counts = fileCounts(file);
 	const pathWidth = Math.max(1, bodyWidth - 2 - visibleWidth(counts) - 2);
 	const path = truncatePathStart(file.label, pathWidth);
-	const row = padded(joinSides(theme.fg(isSelected ? "text" : "muted", path), counts, bodyWidth - 2), bodyWidth);
-	return isSelected ? fillBackground(row, bodyWidth, "selectedBg") : row;
+	const row = padded(
+		joinSides(theme.fg(state === "normal" ? "muted" : "text", path), counts, bodyWidth - 2),
+		bodyWidth,
+	);
+	if (state === "normal") return row;
+	const highlighted = fillBackground(row, bodyWidth, "selectedBg");
+	// Inversion distinguishes hover even on the selected file, including after a truncation reset.
+	return state === "hovered" ? theme.inverse(highlighted.replaceAll("\x1b[0m", "\x1b[0m\x1b[7m")) : highlighted;
 }
 
 /** Syntax-highlighted text when the language is known, otherwise the kind's diff color. */

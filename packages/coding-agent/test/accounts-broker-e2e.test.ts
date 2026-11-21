@@ -12,9 +12,36 @@ import { createModels, type Model } from "@earendil-works/pi-ai";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { buildCatalog } from "../src/extensions/accounts/catalog.ts";
 import { type BrokerAccount, BrokerClient } from "../src/extensions/accounts/client.ts";
-import { type AccountProviderSpec, createAccountProvider, providerSpecs } from "../src/extensions/accounts/provider.ts";
+import {
+	type AccountProviderSpec,
+	type BrokerProviderSpec,
+	createAccountProvider,
+	providerSpecs,
+} from "../src/extensions/accounts/provider.ts";
 
 const brokerBinary = process.env.PI_ACCOUNTS_BROKER;
+
+/**
+ * The broker still balances pool:claude and pool:all. The extension serves them as virtual models instead, so the
+ * catalog no longer lists them and this test builds the broker pools from the accounts itself.
+ */
+function brokerPool(name: string, members: readonly BrokerProviderSpec[]): BrokerProviderSpec {
+	const models = new Map<string, BrokerProviderSpec["models"][number]>();
+	for (const member of members) {
+		for (const model of member.models) {
+			if (!models.has(model.id)) models.set(model.id, { ...model, provider: `pool:${name}` });
+		}
+	}
+	return {
+		id: `pool:${name}`,
+		name,
+		target: { type: "pool", name },
+		family: name,
+		subscription: false,
+		disabled: false,
+		models: [...models.values()],
+	};
+}
 
 /** Fake Anthropic and OpenAI upstream: answers by API key, fails keys on demand, can hang. */
 class FakeUpstream {
@@ -191,8 +218,8 @@ describe.skipIf(!brokerBinary)("account broker end to end", () => {
 	let client: BrokerClient;
 	const models = createModels();
 	const byKey = new Map<string, AccountProviderSpec>();
-	let pool: AccountProviderSpec;
-	let allPool: AccountProviderSpec;
+	let pool: BrokerProviderSpec;
+	let allPool: BrokerProviderSpec;
 	let accounts: BrokerAccount[];
 
 	const first = (spec: AccountProviderSpec) => spec.models[0] as Model<"anthropic-messages">;
@@ -230,8 +257,14 @@ describe.skipIf(!brokerBinary)("account broker end to end", () => {
 			const key = [...upstream.calls].find(([name, count]) => count !== before.get(name))?.[0];
 			if (key) byKey.set(key, spec);
 		}
-		pool = specs.find((spec) => spec.id === "pool:claude")!;
-		allPool = specs.find((spec) => spec.id === "pool:all")!;
+		const pinned = specs.filter((spec) => spec.target.type === "account");
+		pool = brokerPool(
+			"claude",
+			pinned.filter((spec) => spec.family === "claude"),
+		);
+		allPool = brokerPool("all", pinned);
+		models.setProvider(createAccountProvider(pool, client));
+		models.setProvider(createAccountProvider(allPool, client));
 	}, 60_000);
 
 	afterAll(async () => {

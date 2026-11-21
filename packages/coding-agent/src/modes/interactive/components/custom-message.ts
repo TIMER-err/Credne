@@ -2,7 +2,7 @@ import type { TextContent } from "@earendil-works/pi-ai";
 import type { Component } from "@earendil-works/pi-tui";
 import { Box, Container, Markdown, type MarkdownTheme, Spacer, Text } from "@earendil-works/pi-tui";
 import type { MarkdownTransformer, MessageRenderer } from "../../../core/extensions/types.ts";
-import type { CustomMessage } from "../../../core/messages.ts";
+import { type CustomMessage, filterFailedMessages, HIDDEN_CONTEXT_LABEL } from "../../../core/messages.ts";
 import { getMarkdownTheme, theme } from "../theme/theme.ts";
 import { keyHint, keyText } from "./keybinding-hints.ts";
 import { createMarkdownTransform } from "./markdown-transform.ts";
@@ -75,6 +75,7 @@ export class CustomMessageComponent extends Container {
 			this.customComponent = undefined;
 		}
 		this.removeChild(this.box);
+		const hidden = filterFailedMessages([this.message]).length === 0;
 
 		// Try custom renderer first - it handles its own styling
 		if (this.customRenderer) {
@@ -86,8 +87,15 @@ export class CustomMessageComponent extends Container {
 				);
 				if (component) {
 					// Custom renderer provides its own styled component
-					this.customComponent = component;
-					this.addChild(component);
+					if (hidden) {
+						const labeled = new Container();
+						labeled.addChild(new Text(theme.fg("muted", HIDDEN_CONTEXT_LABEL), this.outputPad, 0));
+						labeled.addChild(component);
+						this.customComponent = labeled;
+					} else {
+						this.customComponent = component;
+					}
+					this.addChild(this.customComponent);
 					return;
 				}
 			} catch {
@@ -102,7 +110,7 @@ export class CustomMessageComponent extends Container {
 
 		// Default rendering: label + content
 		const label = theme.fg("customMessageLabel", `\x1b[1m[${this.message.customType}]\x1b[22m`);
-		this.box.addChild(new Text(label, 0, 0));
+		this.box.addChild(new Text(label + (hidden ? ` ${theme.fg("muted", HIDDEN_CONTEXT_LABEL)}` : ""), 0, 0));
 		this.box.addChild(new Spacer(1));
 
 		// Extract text content

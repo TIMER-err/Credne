@@ -19,7 +19,7 @@ import type { Message } from "@earendil-works/pi-ai";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { CONFIG_DIR_NAME, getAgentDir } from "../../config.ts";
-import type { ExtensionAPI } from "../../core/extensions/types.ts";
+import type { ExtensionAPI, ExtensionContext } from "../../core/extensions/types.ts";
 import { formatReadLineRange } from "../../core/tools/render-utils.ts";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncateHead } from "../../core/tools/truncate.ts";
 import { getMarkdownTheme, type ThemeColor } from "../../modes/interactive/theme/theme.ts";
@@ -39,7 +39,7 @@ import {
 	type SubagentDetails,
 } from "./runner.ts";
 import { type SessionPanelResult, SubagentSessionPanel } from "./session-panel.ts";
-import { getWorkerTeam, registerTeamTools } from "./team.ts";
+import { DELEGATION_TOOLS, getWorkerTeam, registerTeamTools, revealTools } from "./team.ts";
 import { registerWorkerCache } from "./worker-cache.ts";
 import { connectWorkerChannel } from "./worker-channel.ts";
 import { registerWorkerPrompt, WORKER_FLAG } from "./worker-prompt.ts";
@@ -291,13 +291,18 @@ const SubagentParams = Type.Object({
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process (single mode)" })),
 });
 
+// Calls that start workers; the first one on a branch reveals DELEGATION_TOOLS.
+const DELEGATING_TOOLS = new Set(["subagent", "assign_tasks", "assign_task"]);
+// The subagent tool's loadout change until the branch delegates: requests leave out the follow-up tools.
+const HIDE_DELEGATION_TOOLS = { hiddenDeclarations: DELEGATION_TOOLS };
+
 export default function (pi: ExtensionAPI) {
 	const dispatch = createSubagentDispatch(pi);
 	registerModelSearch(pi, dispatch);
 	// A worker's system prompt is its agent prompt and its tools are its agent's tools plus messaging,
 	// so workers of one agent type and model share a request head with each other, not with main.
 	const requestParent = connectWorkerChannel(pi);
-	registerTeamTools(pi, requestParent);
+	registerTeamTools(pi, requestParent, dispatch);
 	registerWorkerPrompt(pi);
 	registerWorkerCache(pi, requestParent);
 	pi.registerCommand("subagents", {
@@ -337,11 +342,38 @@ export default function (pi: ExtensionAPI) {
 			);
 		},
 	});
-	// Tool execute results cannot set runtime error state directly, so patch it through the result hook.
+	// Whether this branch has delegated. Read from the branch so resume and /tree keep it.
+	let delegated = false;
+	const syncDelegated = (_event: unknown, ctx: ExtensionContext) => {
+		const next = ctx.sessionManager
+			.getBranch()
+			.some(
+				(entry) =>
+					entry.type === "message" &&
+					entry.message.role === "toolResult" &&
+					DELEGATING_TOOLS.has(entry.message.toolName),
+			);
+		if (next === delegated) return;
+		delegated = next;
+		pi.setActiveTools(pi.getActiveTools());
+	};
+	pi.on("session_start", syncDelegated);
+	pi.on("session_tree", syncDelegated);
 	pi.on("tool_result", (event) => {
-		if (event.toolName !== "subagent") return;
-		const details = event.details as SubagentDetails | undefined;
-		if (details?.isError) return { isError: true };
+		if (!DELEGATING_TOOLS.has(event.toolName)) return;
+		// The first delegation, even a failed one, reveals the follow-up tools, so an unknown model can be looked up.
+		let revealed: string | undefined;
+		if (!delegated) {
+			delegated = true;
+			revealed = revealTools(pi, DELEGATION_TOOLS);
+		}
+		// Tool execute results cannot set runtime error state directly, so patch it through the result hook.
+		const isError = event.toolName === "subagent" && (event.details as SubagentDetails | undefined)?.isError;
+		if (!revealed && !isError) return;
+		return {
+			...(isError && { isError: true }),
+			...(revealed && { content: [...event.content, { type: "text" as const, text: revealed }] }),
+		};
 	});
 
 	pi.registerTool({
@@ -353,12 +385,13 @@ export default function (pi: ExtensionAPI) {
 			"Explorer: choose a cheap, fast model at medium or high thinking effort to search and return information, not to reason about solutions. Worker: choose a capable middle-tier model, such as Sol or Opus 5.5, at xhigh effort to reason during implementation. Crazy: choose an expensive, highly capable model at xhigh or max effort and supply focused context and references so it can concentrate on the hard problem.",
 			"Use background: true for independent work while you continue, then receive each result automatically. Use foreground execution when your next step needs the result immediately.",
 			"Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
-			"Use search_models once when selecting a model; it defaults to five compact cost-ranked results. Reuse a result while the route is valid, and refresh after model/account changes or dispatch failure. Prefer economical models for bounded tasks, but price does not guarantee capability. Use the bare modelId portion of a result ID to stay on the current account; include its provider only when intentionally changing routes.",
-			"Choose model, reasoningEffort, and turn at the top level or per task or chain step. Explicit model overrides the agent profile. turn: 0 starts fresh with only the task, -1 also gives the subagent a copy of the conversation so far with tool outputs shortened, and a positive turn number gives that copy up to a checkpoint from get_subagent_context, including task completions or reviewed milestones. The copy is captured at submission. Use list_agents, send_agent_message, interrupt_agent, continue_agent, and steer_agent to coordinate workers by ID.",
+			"The coordination tools, search_models and get_subagent_context are declared after your first subagent call. Use search_models once when selecting a model; it defaults to five compact cost-ranked results. Reuse a result while the route is valid, and refresh after model/account changes or dispatch failure. Prefer economical models for bounded tasks, but price does not guarantee capability. Use the bare modelId portion of a result ID to stay on the current account; include its provider only when intentionally changing routes.",
+			"Choose model, reasoningEffort, and turn at the top level or per task or chain step. Explicit model overrides the agent profile. turn: 0 starts fresh with only the task, -1 also gives the subagent a copy of the conversation so far with tool outputs shortened, and a positive turn number gives that copy up to a checkpoint from get_subagent_context, including task completions or reviewed milestones. The copy is captured at submission. Use list_agents, send_agent_message, interrupt_agent, continue_agent, steer_agent, and change_agent_model to coordinate workers by ID. change_agent_model changes an idle or interrupted worker's model without losing its conversation; interrupt active workers first.",
 			`Default agent scope is "user" (from ${path.join(getAgentDir(), "agents")}).`,
 			`To enable project-local agents in ${CONFIG_DIR_NAME}/agents, set agentScope: "both" (or "project").`,
 		].join(" "),
 		parameters: SubagentParams,
+		prepareLoadout: () => (delegated ? undefined : HIDE_DELEGATION_TOOLS),
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			if (pi.getFlag(WORKER_FLAG))

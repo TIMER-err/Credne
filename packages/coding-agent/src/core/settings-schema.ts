@@ -1,6 +1,6 @@
 import { type Static, type TSchemaOptions, Type } from "typebox";
 import { ModelThinkingLevelSchema } from "./pi-ai-schemas.ts";
-import { SETTINGS_DEFAULTS } from "./settings-defaults.ts";
+import { SETTINGS_DEFAULTS, SIDE_PANEL_WIDTH_PERCENT_PATTERN } from "./settings-defaults.ts";
 
 function nonNegativeSafeInteger(options: { default?: number } = {}) {
 	return Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER, ...options });
@@ -422,6 +422,34 @@ export const SettingsSchema = Type.Object(
 		websocketConnectTimeoutMs: Type.Optional(
 			timeoutSetting({
 				description: 'WebSocket connect or open handshake timeout in milliseconds; 0 or "disabled" disables it.',
+			}),
+		),
+		sidePanel: Type.Optional(
+			Type.Object({
+				enabled: Type.Optional(
+					Type.Boolean({
+						description:
+							"Show the diff side panel. Global only; restored across sessions and application launches.",
+						default: SETTINGS_DEFAULTS.sidePanel.enabled,
+					}),
+				),
+				width: Type.Optional(
+					Type.Union(
+						[
+							Type.String({ pattern: SIDE_PANEL_WIDTH_PERCENT_PATTERN }),
+							Type.Integer({
+								minimum: 1,
+								maximum: Number.MAX_SAFE_INTEGER,
+								deprecated: true,
+								description: "Legacy width in columns. Converted to a percentage when the panel is shown.",
+							}),
+						],
+						{
+							description: "Share of terminal width, clamped to 25–60%. Global only.",
+							default: `${SETTINGS_DEFAULTS.sidePanel.widthPercent}%`,
+						},
+					),
+				),
 			}),
 		),
 		tuiMode: Type.Optional(

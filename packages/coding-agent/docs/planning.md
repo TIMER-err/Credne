@@ -49,6 +49,8 @@ Task descriptions define scope. Workers share the working directory, so the main
 
 ## Main agent tools
 
+The tools below `enter_plan_mode` are active and callable from the start, but requests leave their declarations out until the conversation branch enters planning: the first `enter_plan_mode` call, or the first saved plan, declares them from the next model call. The revealing result lists them. A resumed branch with a plan or an earlier `enter_plan_mode` call declares them again.
+
 * `enter_plan_mode({})` returns the plan examples only on first entry, plus the current plan snapshot on every call.
 * `create_plan({objective, tasks})` records a plan without starting workers.
 * `task_create({revision, name, description, order, acceptance?, paths?})` adds an individual task.

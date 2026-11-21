@@ -143,7 +143,7 @@ describe("Anthropic preferred strict tool fallback", () => {
 				compat: { ...model.compat, supportsMidConvoSystemMessages: true, supportsMidConvoToolChanges: true },
 			},
 			transcript,
-			{ ...options, apiKey: "sk-ant-oat-test" },
+			options,
 		).result();
 		expect(result.stopReason).toBe("stop");
 		expect(payloads).toHaveLength(2);

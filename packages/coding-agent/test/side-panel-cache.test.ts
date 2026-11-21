@@ -1,3 +1,4 @@
+import type { TuiMouseEvent } from "@earendil-works/pi-tui";
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import {
 	type ChangedFile,
@@ -43,7 +44,7 @@ const rows: DiffRow[] = Array.from({ length: 60 }, (_, index) => ({
 
 /** A 20-row panel leaves 13 code rows below its index and per-file heading. */
 function createPanel(): SidePanel {
-	const panel = new SidePanel({ getHeight: () => 20, getCloseHint: () => "/diff" });
+	const panel = new SidePanel({ getHeight: () => 20, getCloseHint: () => "/diff", resize: () => {} });
 	panel.setChanges(snapshot);
 	panel.setDiff("src/a.ts", { status: "ready", rows });
 	return panel;
@@ -85,6 +86,39 @@ describe("SidePanel diff row cache", () => {
 		panel.setDiff("src/a.ts", { status: "ready", rows });
 		panel.render(70);
 		expect(highlightSpy).toHaveBeenCalledTimes(52);
+	});
+
+	it("retains syntax highlighting across file and separator hover, leave and resize drag", () => {
+		highlightSpy.mockClear();
+		const panel = createPanel();
+		panel.render(60);
+		const move: TuiMouseEvent = {
+			type: "move",
+			button: "none",
+			x: 5,
+			y: 2,
+			screenX: 5,
+			screenY: 2,
+			width: 60,
+			height: 20,
+			shift: false,
+			alt: false,
+			ctrl: false,
+		};
+
+		const events: TuiMouseEvent[] = [
+			move,
+			{ ...move, type: "leave" },
+			{ ...move, x: 0, screenX: 0 },
+			{ ...move, type: "press", button: "left", x: 0, screenX: 0 },
+			{ ...move, type: "drag", button: "left", x: -5, screenX: -5 },
+			{ ...move, type: "release", button: "left", x: -5, screenX: -5 },
+		];
+		for (const event of events) {
+			panel.handleMouse(event);
+			panel.render(60);
+			expect(highlightSpy).toHaveBeenCalledTimes(13);
+		}
 	});
 
 	it("does not highlight when the panel is not rendered", () => {

@@ -4,7 +4,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentToolResult, ThinkingLevel } from "@earendil-works/pi-agent-core";
-import { type Message, type Usage, uuidv7 } from "@earendil-works/pi-ai";
+import { type Api, type AssistantMessage, type Message, type Model, type Usage, uuidv7 } from "@earendil-works/pi-ai";
+import { ToolCallArgumentsStream } from "@earendil-works/pi-ai/utils/streaming-json";
 import { Value } from "typebox/value";
 import { APP_NAME } from "../../config.ts";
 import { CURRENT_SESSION_VERSION, type SessionHeader } from "../../core/session-manager.ts";
@@ -46,6 +47,7 @@ export interface SingleResult {
 	status: ChildStatus;
 	exitCode: number | null;
 	messages: Message[];
+	streamingMessage?: AssistantMessage;
 	stderr: string;
 	/** Provider usage during this run, including active refreshes; later idle refreshes stay in the private session. */
 	usage: UsageStats;
@@ -100,11 +102,13 @@ export interface WorkerSession {
 		makeDetails: (results: SingleResult[]) => SubagentDetails,
 	): Promise<SingleResult>;
 	send(message: string, mode: "steer" | "followUp"): Promise<boolean>;
+	setModel(model: Model<Api>, thinkingLevel: ThinkingLevel): Promise<void>;
 	dispose(): Promise<void>;
 }
 
 interface ActiveRun {
 	result: SingleResult;
+	toolArguments: Map<number, ToolCallArgumentsStream>;
 	/** Set while siblings wait for this run's first response to start streaming. */
 	releaseWarmup?: ReleaseWarmup;
 	cacheKey?: string;
@@ -284,6 +288,7 @@ class ProcessWorker implements WorkerSession {
 		};
 		const active: ActiveRun = {
 			result,
+			toolArguments: new Map(),
 			warmupController: new AbortController(),
 			accepting: true,
 			aborted: false,
@@ -336,6 +341,25 @@ class ProcessWorker implements WorkerSession {
 			if (this.active === active && active.settled && !active.aborted && active.deliveries === 0)
 				this.finishResult();
 		}
+	}
+
+	async setModel(model: Model<Api>, thinkingLevel: ThinkingLevel): Promise<void> {
+		if (this.starting || this.active) throw new Error("Interrupt the worker and wait before changing its model");
+		if (this.disposed) throw new Error("Worker was disposed");
+		if (this.initialization) {
+			await this.ensureStarted();
+			await this.command({ type: "set_model", provider: model.provider, modelId: model.id });
+			this.defaults.model = `${model.provider}/${model.id}`;
+			try {
+				await this.command({ type: "set_thinking_level", level: thinkingLevel });
+			} catch (error) {
+				const state = await this.command({ type: "get_state" }).catch(() => undefined);
+				if (state?.success && state.command === "get_state") this.defaults.thinkingLevel = state.data.thinkingLevel;
+				throw error;
+			}
+		}
+		this.defaults.model = `${model.provider}/${model.id}`;
+		this.defaults.thinkingLevel = thinkingLevel;
 	}
 
 	dispose(): Promise<void> {
@@ -525,12 +549,23 @@ class ProcessWorker implements WorkerSession {
 			if (!active.aborted && active.deliveries === 0) this.finishResult();
 			return;
 		}
-		if (event.type === "message_update") return;
+		if (event.type === "message_start" && event.message.role === "assistant") {
+			active.result.streamingMessage = event.message;
+			active.toolArguments.clear();
+			active.update();
+			return;
+		}
+		if (event.type === "message_update") {
+			updateStreamingMessage(active, event);
+			return;
+		}
 		if (event.type !== "message_end") return;
 		const message = event.message;
 		if (message.role !== "user" && message.role !== "assistant" && message.role !== "toolResult") return;
 		active.result.messages.push(message);
 		if (message.role === "assistant") {
+			active.result.streamingMessage = undefined;
+			active.toolArguments.clear();
 			recordAssistant(active.result, message);
 			this.recordBillableUsage(message.usage);
 		} else if (message.role === "toolResult" && message.usage) {
@@ -690,6 +725,61 @@ class ProcessWorker implements WorkerSession {
 		this.fail(new Error("Worker was disposed"));
 		if (this.tempDir) await fs.promises.rm(this.tempDir, { recursive: true, force: true });
 	}
+}
+
+function updateStreamingMessage(
+	active: ActiveRun,
+	event: Extract<JsonAgentSessionEvent, { type: "message_update" }>,
+): void {
+	const message = active.result.streamingMessage;
+	if (!message) return;
+	message.usage = event.usage;
+	const delta = event.assistantMessageEvent;
+	switch (delta.type) {
+		case "text_start":
+			message.content[delta.contentIndex] = { type: "text", text: "" };
+			break;
+		case "text_delta": {
+			const content = message.content[delta.contentIndex];
+			if (content?.type === "text") content.text += delta.delta;
+			break;
+		}
+		case "text_end":
+			message.content[delta.contentIndex] = { type: "text", text: delta.content };
+			break;
+		case "thinking_start":
+			message.content[delta.contentIndex] = { type: "thinking", thinking: "" };
+			break;
+		case "thinking_delta": {
+			const content = message.content[delta.contentIndex];
+			if (content?.type === "thinking") content.thinking += delta.delta;
+			break;
+		}
+		case "thinking_end":
+			message.content[delta.contentIndex] = { type: "thinking", thinking: delta.content };
+			break;
+		case "toolcall_start":
+			message.content[delta.contentIndex] = { type: "toolCall", id: delta.id, name: delta.toolName, arguments: {} };
+			active.toolArguments.set(delta.contentIndex, new ToolCallArgumentsStream());
+			break;
+		case "toolcall_delta": {
+			const content = message.content[delta.contentIndex];
+			const args = active.toolArguments.get(delta.contentIndex);
+			if (content?.type === "toolCall" && args) content.arguments = args.append(delta.delta);
+			break;
+		}
+		case "toolcall_end":
+			message.content[delta.contentIndex] = delta.toolCall;
+			active.toolArguments.delete(delta.contentIndex);
+			break;
+		case "done":
+			active.result.streamingMessage = delta.message;
+			break;
+		case "error":
+			active.result.streamingMessage = delta.error;
+			break;
+	}
+	active.update();
 }
 
 function recordAssistant(result: SingleResult, message: Extract<Message, { role: "assistant" }>): void {

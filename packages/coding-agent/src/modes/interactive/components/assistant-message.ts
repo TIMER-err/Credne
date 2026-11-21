@@ -9,6 +9,7 @@ import {
 	Text,
 } from "@earendil-works/pi-tui";
 import type { MarkdownTransformer } from "../../../core/extensions/types.ts";
+import { HIDDEN_CONTEXT_LABEL } from "../../../core/messages.ts";
 import { getMarkdownTheme, theme } from "../theme/theme.ts";
 import { createMarkdownTransform } from "./markdown-transform.ts";
 
@@ -254,6 +255,9 @@ export class AssistantMessageComponent extends Container {
 				this.contentContainer.addChild(new Spacer(1));
 				this.contentContainer.addChild(new Text(theme.fg("error", `Error: ${errorMsg}`), this.outputPad, 0));
 			}
+		}
+		if (message.stopReason === "error" || message.stopReason === "aborted") {
+			this.contentContainer.addChild(new Text(theme.fg("muted", HIDDEN_CONTEXT_LABEL), this.outputPad, 0));
 		}
 	}
 }

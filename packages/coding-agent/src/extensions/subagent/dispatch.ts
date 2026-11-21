@@ -5,8 +5,15 @@ import { type Api, clampThinkingLevel, getSupportedThinkingLevels, type Model } 
 import { Type } from "typebox";
 import { getAgentDir } from "../../config.ts";
 import type { ExtensionAPI, ExtensionContext } from "../../core/extensions/types.ts";
-import { ACCOUNT_PROVIDER_PREFIX, accountProviderId, POOL_PROVIDER_PREFIX, readCatalog } from "../accounts/catalog.ts";
+import {
+	ACCOUNT_PROVIDER_PREFIX,
+	accountProviderId,
+	isVirtualPoolProvider,
+	POOL_PROVIDER_PREFIX,
+	readCatalog,
+} from "../accounts/catalog.ts";
 import { ACCOUNT_HEADER } from "../accounts/provider.ts";
+import { isAccountProvider, latestServingProvider } from "../accounts/served.ts";
 
 /** Reasoning levels accepted by child dispatch tools. */
 export const reasoningEffortSchema = Type.Union([
@@ -148,10 +155,20 @@ function selectModel(text: string, pool: { provider: string; models: Model<Api>[
 	);
 }
 
+/** A virtual pool picks its account per request, so a worker inherits the account that answered last. */
+function servingAccount(ctx: ExtensionContext): string {
+	const served = latestServingProvider(ctx.sessionManager.getBranch());
+	if (served && isAccountProvider(served)) return served;
+	throw new Error(
+		"The parent pool's serving account is unknown. Wait for a parent response or choose an explicit provider/model ID.",
+	);
+}
+
 function currentProvider(accountKey: string | undefined, ctx: ExtensionContext): string {
 	const parent = ctx.model;
 	if (!parent) throw new Error("A parent model or explicit provider is required. Use search_models with a provider.");
 	if (parent.provider.startsWith(ACCOUNT_PROVIDER_PREFIX)) return parent.provider;
+	if (isVirtualPoolProvider(parent.provider)) return servingAccount(ctx);
 	if (parent.provider.startsWith(POOL_PROVIDER_PREFIX)) {
 		const account = readCatalog(join(getAgentDir(), "accounts", "catalog.json")).accounts.find(
 			(candidate) => candidate.key === accountKey && !candidate.disabled,

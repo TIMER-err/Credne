@@ -14,6 +14,7 @@ import { SessionManager } from "../src/core/session-manager.ts";
 import { completeTask, createPlan, startTasks, type TaskSpec } from "../src/extensions/planning/graph.ts";
 import planningExtension from "../src/extensions/planning/index.ts";
 import { discoverAgents, discoverBundledAgents } from "../src/extensions/subagent/agents.ts";
+import { createSubagentDispatch } from "../src/extensions/subagent/dispatch.ts";
 import { emptyUsage, type SingleResult } from "../src/extensions/subagent/runner.ts";
 import { registerTeamTools, type SpawnInput, WorkerTeam } from "../src/extensions/subagent/team.ts";
 import {
@@ -114,7 +115,7 @@ describe("planned worker request layout", () => {
 			const extensionsResult = await createTestExtensionsResult([
 				(pi) => {
 					registerWorkerPrompt(pi);
-					registerTeamTools(pi, async () => []);
+					registerTeamTools(pi, async () => [], createSubagentDispatch(pi));
 				},
 				planningExtension,
 				createToolSearchExtension(),

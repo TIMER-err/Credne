@@ -2,7 +2,8 @@ import type { Api, Model } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../core/extensions/types.ts";
 import { openBrowser } from "../../utils/open-browser.ts";
 import { ALL_POOL, accountDisplayName, accountProviderId, familyTitle, poolProviderId } from "./catalog.ts";
-import type { BrokerAccount, BrokerClient, BrokerLogin } from "./client.ts";
+import type { LocalClaude, LocalClaudeAccount } from "./claude-local.ts";
+import type { BrokerAccount, BrokerClient, BrokerLogin, BrokerUsage } from "./client.ts";
 import { sessionAccountCosts } from "./costs.ts";
 import { type AccountPanelResult, AccountsPanel } from "./panel.ts";
 import type { AccountProviderSpec } from "./provider.ts";
@@ -12,6 +13,7 @@ export interface AccountCommandDeps {
 	pi: ExtensionAPI;
 	client: BrokerClient;
 	registry: AccountRegistry;
+	local: LocalClaude;
 }
 
 /** `/accounts` subcommands, also used for argument completion. */
@@ -49,7 +51,14 @@ interface ApiKeyWay {
 	placeholder: string;
 }
 
-type AddWay = LoginWay | ApiKeyWay;
+/** A Claude subscription sign-in that this process runs itself: tokens are stored and refreshed locally. */
+interface LocalClaudeWay {
+	id: string;
+	label: string;
+	kind: "claude-local";
+}
+
+type AddWay = LoginWay | ApiKeyWay | LocalClaudeWay;
 
 interface AddFamily {
 	id: string;
@@ -59,8 +68,9 @@ interface AddFamily {
 
 /**
  * What `/accounts add` offers: the first menu lists the families, the second the ways of one family;
- * a family with a single way skips the second menu. `claude-api-credits` signs in to a Claude Console
- * organization through `ant`. The ids are the arguments of `/accounts add <id>`.
+ * a family with a single way skips the second menu. `claude-subscription` signs in here; the other
+ * sign-ins go through the broker. `claude-api-credits` signs in to a Claude Console organization through
+ * `ant`. The ids are the arguments of `/accounts add <id>`.
  */
 const ADD_FAMILIES: readonly AddFamily[] = [
 	{
@@ -70,9 +80,7 @@ const ADD_FAMILIES: readonly AddFamily[] = [
 			{
 				id: "claude-subscription",
 				label: "Subscription (Pro, Max, Team sign-in)",
-				kind: "login",
-				provider: "claude",
-				title: familyTitle("claude"),
+				kind: "claude-local",
 			},
 			{
 				id: "claude-api-credits",
@@ -128,7 +136,7 @@ const LOGIN_POLL_MS = 1_000;
 export async function showAccounts(deps: AccountCommandDeps, ctx: ExtensionCommandContext): Promise<void> {
 	let selectedId: string | undefined;
 	for (;;) {
-		const accounts = await deps.registry.sync(ctx);
+		const accounts = managedAccounts(deps, await deps.registry.sync(ctx));
 		if (!ctx.hasUI) {
 			ctx.ui.notify(formatAccountList(accounts, ctx), "info");
 			return;
@@ -140,21 +148,19 @@ export async function showAccounts(deps: AccountCommandDeps, ctx: ExtensionComma
 					currentId: ctx.model?.provider,
 					selectedId,
 					entries: deps.registry.providers().map((spec) => {
-						const target = spec.target;
-						const account =
-							target.type === "account" ? accounts.find((entry) => entry.key === target.key) : undefined;
+						const account = accounts.find((entry) => entry.providerId === spec.id);
 						return {
 							id: spec.id,
 							name: spec.name,
 							state: account
-								? `${accountState(account)} · ${account.modelCount} models`
-								: `${spec.models.length} models · balanced pool`,
-							accountKey: account?.key,
+								? `${account.state} · ${account.modelCount} models`
+								: `${spec.models.length} models · ${poolRouting(spec)}`,
+							account: account !== undefined,
 							disabled: spec.disabled,
 							costs: sessionAccountCosts(entries, spec.id),
 						};
 					}),
-					usage: (key, signal) => deps.client.accountUsage(key, signal),
+					usage: (providerId, signal) => accountUsage(deps, accounts, providerId, signal),
 				}),
 		);
 		selectedId = result.selectedId;
@@ -178,7 +184,7 @@ export async function showAccounts(deps: AccountCommandDeps, ctx: ExtensionComma
 				const model = await chooseModel(ctx, spec, providerModels(ctx, spec));
 				if (model) await useModel(deps, ctx, spec, model);
 			} else {
-				const account = accounts.find((entry) => accountProviderId(entry.id) === spec.id);
+				const account = accounts.find((entry) => entry.providerId === spec.id);
 				if (account) await manageAccount(deps, ctx, account);
 			}
 		}
@@ -214,7 +220,7 @@ export async function runAccountCommand(
 		case "enable":
 		case "disable":
 		case "reset": {
-			const accounts = await deps.registry.sync(ctx);
+			const accounts = managedAccounts(deps, await deps.registry.sync(ctx));
 			const account = await chooseAccount(ctx, accounts, `${subcommand} account`, query);
 			if (account) await applyAccountAction(deps, ctx, account, subcommand);
 			return;
@@ -247,20 +253,22 @@ function showStatus(deps: AccountCommandDeps, ctx: ExtensionContext): void {
 	const spec = deps.registry.provider(model?.provider ?? "");
 	if (!model || !spec) {
 		const current = model ? `${model.provider}/${model.id}` : "no model";
-		ctx.ui.notify(`This session uses ${current}, not a broker account. Use /accounts switch.`, "info");
+		ctx.ui.notify(`This session uses ${current}, not one of the accounts. Use /accounts switch.`, "info");
 		return;
 	}
-	const routing =
-		spec.target.type === "account"
-			? "pinned; failures are reported, never rerouted"
-			: "pool; the broker balances and fails over";
+	const routing = {
+		account: "pinned; failures are reported, never rerouted",
+		local: "pinned; failures are reported, never rerouted",
+		pool: "pool; the broker balances and fails over",
+		"virtual-pool": "pool; subscriptions first, then API accounts, and a limit hands the session to the next account",
+	}[spec.target.type];
 	ctx.ui.notify(`This session uses ${model.id} on ${spec.name} (${routing}).`, "info");
 }
 
 async function manageAccount(
 	deps: AccountCommandDeps,
 	ctx: ExtensionCommandContext,
-	account: BrokerAccount,
+	account: ManagedAccount,
 ): Promise<void> {
 	const actions = {
 		use: "Use in this session",
@@ -269,8 +277,8 @@ async function manageAccount(
 		reset: "Clear cooldown",
 		remove: "Remove",
 	};
-	const choice = await ctx.ui.select(accountDisplayName(account), [...Object.values(actions), "Back"]);
-	const spec = deps.registry.provider(accountProviderId(account.id));
+	const choice = await ctx.ui.select(account.name, [...Object.values(actions), "Back"]);
+	const spec = deps.registry.provider(account.providerId);
 	if (choice === actions.use && spec) await switchTo(deps, ctx, spec, true);
 	else if (choice === actions.model && spec) {
 		const model = await chooseModel(ctx, spec, providerModels(ctx, spec));
@@ -281,24 +289,40 @@ async function manageAccount(
 	else if (choice === actions.remove) await applyAccountAction(deps, ctx, account, "remove");
 }
 
+type AccountAction = "remove" | "enable" | "disable" | "reset";
+
 async function applyAccountAction(
 	deps: AccountCommandDeps,
 	ctx: ExtensionCommandContext,
-	account: BrokerAccount,
-	action: "remove" | "enable" | "disable" | "reset",
+	account: ManagedAccount,
+	action: AccountAction,
 ): Promise<void> {
-	const name = accountDisplayName(account);
-	if (action === "remove") {
-		if (ctx.hasUI && !(await ctx.ui.confirm("Remove account?", `${name}\nIts stored credential is deleted.`))) return;
-		await deps.client.removeAccount(account.key);
-	} else if (action === "reset") {
-		await deps.client.resetCooldown(account.key);
-	} else {
-		await deps.client.setDisabled(account.key, action === "disable");
+	const name = account.name;
+	if (action === "remove" && ctx.hasUI) {
+		if (!(await ctx.ui.confirm("Remove account?", `${name}\nIts stored credential is deleted.`))) return;
 	}
+	await changeAccount(deps, account, action);
 	await deps.registry.sync(ctx);
 	const done = { remove: "Removed", enable: "Enabled", disable: "Disabled", reset: "Cleared cooldown for" }[action];
 	ctx.ui.notify(`${done} ${name}`, "info");
+}
+
+/** Apply an action to a local subscription in the credential store, or to a broker account through the broker. */
+async function changeAccount(deps: AccountCommandDeps, account: ManagedAccount, action: AccountAction): Promise<void> {
+	if (account.source === "local") {
+		const { providerId } = account.local;
+		if (action === "remove") await deps.local.store.remove(providerId);
+		else if (action === "enable" || action === "disable") {
+			await deps.local.store.setDisabled(providerId, action === "disable");
+		}
+		// A removed account keeps nothing; a cleared one is tried again at once.
+		if (action === "remove" || action === "reset") deps.local.limits.clear(providerId);
+		return;
+	}
+	const { key } = account.broker;
+	if (action === "remove") await deps.client.removeAccount(key);
+	else if (action === "reset") await deps.client.resetCooldown(key);
+	else await deps.client.setDisabled(key, action === "disable");
 }
 
 /** Switch this session to an account or pool; with `persist` it also becomes the default for new sessions. */
@@ -371,9 +395,33 @@ async function addAccount(deps: AccountCommandDeps, ctx: ExtensionCommandContext
 	const way = await chooseAddWay(ctx, requested.trim().toLowerCase());
 	if (!way) return;
 	const hadAccounts = deps.registry.providers().length > 0;
+	const added = await runAddWay(deps, ctx, way);
+	if (added) await finishAdding(deps, ctx, added, hadAccounts);
+}
+
+/** Add an account the chosen way; the message to show once it is registered, or undefined when cancelled. */
+async function runAddWay(
+	deps: AccountCommandDeps,
+	ctx: ExtensionCommandContext,
+	way: AddWay,
+): Promise<string | undefined> {
+	if (way.kind === "claude-local") return addLocalClaude(deps, ctx);
 	const account =
 		way.kind === "api-key" ? await addApiKeyAccount(deps, ctx, way) : await signInAccount(deps, ctx, way);
-	if (account) await finishAdding(deps, ctx, account, hadAccounts);
+	return account && `Added ${accountDisplayName(account)}. It funds the matching pools; /accounts switch pins it.`;
+}
+
+/** Sign in to a Claude subscription in the browser and store it locally; the broker is not involved. */
+async function addLocalClaude(deps: AccountCommandDeps, ctx: ExtensionCommandContext): Promise<string | undefined> {
+	// The login derives the account's Claude Code device id from the installation's id.
+	const installId = deps.local.store.installationId(deps.pi.getSettings().deviceId);
+	const result = await deps.local.signIn(ctx.ui, installId);
+	if (result.type === "cancelled" || result.type === "timed-out") {
+		ctx.ui.notify(result.type === "cancelled" ? "Sign-in cancelled." : "Sign-in timed out.", "warning");
+		return undefined;
+	}
+	if (!result.added) return `Signed in again to ${result.account.name}.`;
+	return `Added ${result.account.name}. It funds pool:claude and pool:all; /accounts switch pins it.`;
 }
 
 /** The way to add an account, from the argument of `/accounts add` or from the menus; undefined when cancelled. */
@@ -485,14 +533,11 @@ async function waitForLogin(
 async function finishAdding(
 	deps: AccountCommandDeps,
 	ctx: ExtensionCommandContext,
-	account: BrokerAccount,
+	message: string,
 	hadAccounts: boolean,
 ): Promise<void> {
 	await deps.registry.sync(ctx);
-	ctx.ui.notify(
-		`Added ${accountDisplayName(account)}. It funds the matching pools; /accounts switch pins it.`,
-		"info",
-	);
+	ctx.ui.notify(message, "info");
 	if (!hadAccounts) await adoptPoolAsDefault(deps, ctx);
 }
 
@@ -546,10 +591,10 @@ async function chooseProvider(
 
 async function chooseAccount(
 	ctx: ExtensionCommandContext,
-	accounts: readonly BrokerAccount[],
+	accounts: readonly ManagedAccount[],
 	title: string,
 	query: string,
-): Promise<BrokerAccount | undefined> {
+): Promise<ManagedAccount | undefined> {
 	const matches = query ? accounts.filter((account) => accountMatches(account, query)) : accounts;
 	if (matches.length === 1) return matches[0];
 	if (matches.length === 0 || !ctx.hasUI) {
@@ -559,16 +604,14 @@ async function chooseAccount(
 		);
 		return undefined;
 	}
-	const options = matches.map((account) => accountDisplayName(account));
+	const options = matches.map((account) => account.name);
 	const choice = await ctx.ui.select(title, options);
 	return choice ? matches[options.indexOf(choice)] : undefined;
 }
 
-function accountMatches(account: BrokerAccount, query: string): boolean {
+function accountMatches(account: ManagedAccount, query: string): boolean {
 	const needle = query.toLowerCase();
-	return [account.id, accountProviderId(account.id), account.email, account.label]
-		.filter((value): value is string => value !== undefined)
-		.some((value) => value.toLowerCase().includes(needle));
+	return account.aliases.some((value) => value?.toLowerCase().includes(needle));
 }
 
 function matchProviders(providers: readonly AccountProviderSpec[], query: string): AccountProviderSpec[] {
@@ -579,14 +622,75 @@ function matchProviders(providers: readonly AccountProviderSpec[], query: string
 		: providers.filter((spec) => `${spec.id} ${spec.name}`.toLowerCase().includes(needle));
 }
 
-function accountLine(account: BrokerAccount, ctx: ExtensionContext): string {
-	const current = ctx.model?.provider === accountProviderId(account.id) ? "* " : "  ";
-	return `${current}${accountDisplayName(account)} - ${accountState(account)} - ${account.modelCount} models`;
+function accountLine(account: ManagedAccount, ctx: ExtensionContext): string {
+	const current = ctx.model?.provider === account.providerId ? "* " : "  ";
+	return `${current}${account.name} - ${account.state} - ${account.modelCount} models`;
 }
 
-function formatAccountList(accounts: readonly BrokerAccount[], ctx: ExtensionContext): string {
+function formatAccountList(accounts: readonly ManagedAccount[], ctx: ExtensionContext): string {
 	if (accounts.length === 0) return "No accounts. Add one with /accounts add in interactive mode.";
 	return accounts.map((account) => accountLine(account, ctx)).join("\n");
+}
+
+/** An account `/accounts` lists and manages: a local Claude subscription or a broker account. */
+type ManagedAccount = {
+	providerId: string;
+	name: string;
+	state: string;
+	disabled: boolean;
+	modelCount: number;
+	/** Texts a query may match: ids, email, label. */
+	aliases: readonly (string | undefined)[];
+} & ({ source: "local"; local: LocalClaudeAccount } | { source: "broker"; broker: BrokerAccount });
+
+/** Local subscriptions first, then the broker's accounts. */
+function managedAccounts(deps: AccountCommandDeps, brokerAccounts: readonly BrokerAccount[]): ManagedAccount[] {
+	const locals = deps.local.accounts().map(
+		(account): ManagedAccount => ({
+			providerId: account.providerId,
+			name: account.name,
+			state: deps.local.state(account),
+			disabled: account.disabled,
+			modelCount: deps.registry.provider(account.providerId)?.models.length ?? 0,
+			aliases: [account.id, account.providerId, account.email, account.orgName],
+			source: "local",
+			local: account,
+		}),
+	);
+	const brokered = brokerAccounts.map(
+		(account): ManagedAccount => ({
+			providerId: accountProviderId(account.id),
+			name: accountDisplayName(account),
+			state: accountState(account),
+			disabled: account.disabled,
+			modelCount: account.modelCount,
+			aliases: [account.id, accountProviderId(account.id), account.email, account.label],
+			source: "broker",
+			broker: account,
+		}),
+	);
+	return [...locals, ...brokered];
+}
+
+function accountUsage(
+	deps: AccountCommandDeps,
+	accounts: readonly ManagedAccount[],
+	providerId: string,
+	signal: AbortSignal,
+): Promise<BrokerUsage> {
+	const account = accounts.find((entry) => entry.providerId === providerId);
+	if (account?.source === "local") return deps.local.usage(providerId, signal);
+	if (account?.source === "broker") return deps.client.accountUsage(account.broker.key, signal);
+	return Promise.resolve({
+		status: "unavailable",
+		reason: "Select an account to see its usage.",
+		windows: [],
+		credits: [],
+	});
+}
+
+function poolRouting(spec: AccountProviderSpec): string {
+	return spec.target.type === "virtual-pool" ? "subscriptions first, then API accounts" : "balanced pool";
 }
 
 /** Short availability summary from broker state. */

@@ -708,7 +708,8 @@ export class InteractiveMode {
 		this.footerContainer.addChild(this.footer);
 		this.sidePanel = new SidePanelController({
 			ui: this.ui,
-			getCwd: () => this.sessionManager.getCwd(),
+			getSessionManager: () => this.sessionManager,
+			getSettingsManager: () => this.settingsManager,
 			getCloseHint: () => keyText("app.sidePanel.toggle") || "/diff",
 			showStatus: (message) => this.showStatus(message),
 			reserveTranscriptColumns: (getWidth) => this.reserveTranscriptColumns(getWidth),
@@ -977,7 +978,7 @@ export class InteractiveMode {
 
 	private stopInteractiveTui(fullscreenExitOutput: FullscreenExitOutput): void {
 		// The panel must not narrow the transcript that fullscreen exit prints.
-		this.sidePanel.close();
+		this.sidePanel.stop();
 		if (this.renderer.mode === "fullscreen" && fullscreenExitOutput === "transcript") {
 			while (this.renderer.hasOverlayEntries) this.renderer.hideOverlay();
 			this.switchTuiMode("regular", false, false);
@@ -1181,6 +1182,9 @@ export class InteractiveMode {
 		}
 		if (this.renderer.mode === "fullscreen") this.showFullscreenModelScopeNotice();
 		this.ui.requestRender();
+		// Open the model API connection while the user reads the first frame. Deferred a turn of the event loop so
+		// the connection work never lands ahead of the first paint.
+		setImmediate(() => this.session.prewarmModelConnection());
 
 		// Ensure fd and rg are available after mounting the TUI (downloads if missing, adds to PATH via getBinDir)
 		// so slow downloads do not make startup appear frozen.
@@ -2295,7 +2299,6 @@ export class InteractiveMode {
 			this.subscribeToAgent();
 		}
 
-		// A new session is active, at startup or after a switch: the side panel shows changes made from here on.
 		this.sidePanel.beginSession();
 
 		await this.updateAvailableProviderCount();
@@ -3351,6 +3354,9 @@ export class InteractiveMode {
 		this.defaultEditor.onAction("app.sidePanel.scrollUp", () => this.sidePanel.scrollDiffPage(-1));
 
 		this.defaultEditor.onChange = (text: string) => {
+			// Typing signals an imminent turn; refresh the API connection now so the handshake overlaps composition
+			// instead of delaying the send. Throttled, and a no-op mid-turn.
+			if (text) this.session.prewarmModelConnection();
 			const wasBashMode = this.isBashMode;
 			this.isBashMode = text.trimStart().startsWith("!");
 			if (wasBashMode !== this.isBashMode) {
@@ -4000,7 +4006,7 @@ export class InteractiveMode {
 				// Set up escape to abort retry
 				this.retryEscapeHandler = this.defaultEditor.onEscape;
 				this.defaultEditor.onEscape = () => {
-					this.restoreQueuedMessagesToEditor({ abort: true });
+					void this.session.interrupt();
 				};
 				this.showStatusIndicator(
 					new RetryStatusIndicator(this.ui, event.attempt, event.maxAttempts, event.delayMs),
@@ -5091,7 +5097,7 @@ export class InteractiveMode {
 		if (allQueued.length === 0) {
 			this.updatePendingMessagesDisplay();
 			if (options?.abort) {
-				void this.session.abort();
+				void this.session.interrupt();
 			}
 			return 0;
 		}
@@ -5101,7 +5107,7 @@ export class InteractiveMode {
 		this.editor.setText(combinedText);
 		this.updatePendingMessagesDisplay();
 		if (options?.abort) {
-			void this.session.abort();
+			void this.session.interrupt();
 		}
 		return allQueued.length;
 	}
@@ -6055,8 +6061,7 @@ export class InteractiveMode {
 						: SessionManager.listAll(this.sessionManager.getSessionDir(), onProgress, signal),
 				async (sessionPath) => {
 					done();
-					const result = await this.handleResumeSession(sessionPath);
-					if (!result.cancelled) void this.offerInterruptedRun();
+					await this.handleResumeSession(sessionPath);
 				},
 				() => {
 					done();
@@ -6086,7 +6091,6 @@ export class InteractiveMode {
 	private async offerInterruptedRun(): Promise<void> {
 		const session = this.session;
 		if (!session.canContinueInterruptedRun) return;
-		const leafId = session.sessionManager.getLeafId();
 		const resume = "Continue the unfinished turn";
 		const redirect = "Stop and give new instructions";
 		try {
@@ -6094,7 +6098,7 @@ export class InteractiveMode {
 				resume,
 				redirect,
 			]);
-			if (this.session !== session || session.sessionManager.getLeafId() !== leafId) return;
+			if (this.session !== session || !session.canContinueInterruptedRun) return;
 			if (choice === resume) {
 				await this.continueInterruptedRun(session);
 			} else if (choice === redirect) {
@@ -6118,6 +6122,15 @@ export class InteractiveMode {
 	}
 
 	private async handleResumeSession(
+		sessionPath: string,
+		options?: Parameters<ExtensionCommandContext["switchSession"]>[1],
+	): Promise<{ cancelled: boolean }> {
+		const result = await this.switchToSavedSession(sessionPath, options);
+		if (!result.cancelled) void this.offerInterruptedRun();
+		return result;
+	}
+
+	private async switchToSavedSession(
 		sessionPath: string,
 		options?: Parameters<ExtensionCommandContext["switchSession"]>[1],
 	): Promise<{ cancelled: boolean }> {

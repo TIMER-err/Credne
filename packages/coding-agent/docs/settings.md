@@ -98,6 +98,8 @@ See [Compaction Reference](compaction.md) for trigger, summarization, and valida
 | `fullscreenExitOutput` | `"transcript" \| "resume-hint"` | `"transcript"` | Output printed when fullscreen mode exits. |
 | `fullscreenScrollbar` | `"auto" \| "always" \| "hidden"` | `"auto"` | Fullscreen transcript scrollbar behavior. |
 | `fullscreenCopyOnSelect` | boolean | `true` | Copy selected text automatically in fullscreen mode. |
+| `sidePanel.enabled` | boolean | `false` | Remember whether the `/diff` side panel is open across launches. Global setting only. |
+| `sidePanel.width` | Percentage string | `"40%"` | Share of the terminal width used by the `/diff` panel, clamped to 25–60%. Global setting only. |
 | `fullscreenWheelScrollLines` | `"auto"` \| number | `"auto"` | Lines per mouse-wheel event in fullscreen mode, from 1 to 100. `"auto"` moves one line per event in local macOS terminals, which already accelerate wheel and trackpad input; elsewhere, and over SSH, it speeds up fast wheel spins to at most 6 lines per event. Alt+wheel moves five times as far. |
 | `editorPaddingX` | number | `0` | Horizontal editor padding from 0 to 3 cells. |
 | `outputPad` | `0 \| 1` | `1` | Horizontal transcript padding for messages, tool output, `!` command output, and summary blocks. |
@@ -114,6 +116,10 @@ See [Compaction Reference](compaction.md) for trigger, summarization, and valida
 | `images.blockImages` | boolean | `false` | Prevent images from being sent to models. |
 | `markdown.codeBlockIndent` | string | `"  "` | Prefix used to indent rendered code blocks. |
 | `markdown.mermaid` | `"off" \| "final" \| "streaming"` | `"streaming"` | Mermaid rendering mode. |
+
+The `/diff` panel needs at least 80 terminal columns. If `sidePanel.width` was saved as a number of columns, Pi converts it to a percentage using the terminal width the first time the panel is shown. For example, a saved width of `60` becomes `"40%"` in a 150-column terminal. Dragging the divider saves the new percentage for future launches.
+
+The `/diff` panel restores the original comparison baseline when you resume a saved session, so its changes remain visible after restarting. A new session starts a new baseline. File rows highlight on hover, and the divider highlights on hover and while dragging to resize.
 
 See [Themes](themes.md) and [Terminal Setup](terminal-setup.md) for format and platform details.
 

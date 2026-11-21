@@ -39,6 +39,7 @@ import {
 	getSystemMessageText,
 	retryDelayMs,
 } from "@earendil-works/pi-ai";
+import { prewarmModelConnection } from "@earendil-works/pi-ai/api/claude-subscription/prewarm";
 import type {
 	AssistantMessage,
 	AuthResult,
@@ -72,6 +73,7 @@ import { formatNoApiKeyFoundMessage, formatNoModelSelectedMessage } from "./auth
 import { type BashResult, executeBashWithOperations } from "./bash-executor.ts";
 import { generateBugReportSummary } from "./bug-report.ts";
 import type { CacheWarmer, CacheWarmingStatus } from "./cache-warmer.ts";
+import { getClientIdentity } from "./client-identity.ts";
 import {
 	type CompactionPreparation,
 	type CompactionResult,
@@ -1574,6 +1576,18 @@ export class AgentSession {
 		return !this._isAgentRunActive && !this.isCompacting;
 	}
 
+	/**
+	 * Warms the active model's API connection while idle, so the next turn skips DNS, TCP and TLS. Acts only for a
+	 * model served by a Claude subscription (OAuth) credential: its requests go through the Claude Code transport
+	 * the warm-up shares sockets with, while API key requests use another one. Throttled and best effort; a no-op
+	 * mid-turn, where the pooled socket is busy and a warm-up would open a redundant one.
+	 */
+	prewarmModelConnection(): void {
+		const model = this.routedModel?.model ?? this.model;
+		if (!model || this.isStreaming || !this._modelRuntime.isUsingOAuth(model.provider)) return;
+		void prewarmModelConnection(model, { identity: getClientIdentity(this.settingsManager) });
+	}
+
 	/** Current effective system prompt, including changes not yet sent to the model. */
 	get systemPrompt(): string {
 		return (
@@ -1983,8 +1997,8 @@ export class AgentSession {
 		let messages: AgentMessage[];
 		try {
 			messages = await this._prepareRun(trigger);
-			// A custom run's trigger looks like a context-only entry. Unlike a new user
-			// message, it needs an explicit boundary to supersede an earlier interruption.
+			// A new user message supersedes an interruption in history. A custom run's trigger looks
+			// like a context-only entry, so record that it supersedes the interruption explicitly.
 			if (trigger.messageType === "custom" && this._findInterruptedRun()) {
 				this.sessionManager.appendCustomEntry(DISMISSED_INTERRUPTED_RUN_ENTRY);
 			}
@@ -2681,6 +2695,11 @@ export class AgentSession {
 		return this._resourceLoader;
 	}
 
+	/** Interrupt the current run and allow it to be continued after it settles. */
+	interrupt(): Promise<void> {
+		return this.abort();
+	}
+
 	/** Whether the idle branch has an unfinished turn that can be continued. */
 	get canContinueInterruptedRun(): boolean {
 		return this.isIdle && this._findInterruptedRun() !== undefined && this._hasInterruptedRunContext();
@@ -2703,7 +2722,7 @@ export class AgentSession {
 		const promptOptions =
 			run?.entryId === entry.id && run.sessionId === this.sessionId ? run.promptOptions : undefined;
 		const systemMessage = promptOptions ? undefined : getCurrentSystemMessage(this.messages);
-		const recordedPrompt = systemMessage ? getSystemMessageText(systemMessage) : undefined;
+		const recordedPrompt = systemMessage ? getSystemMessageText(systemMessage) || undefined : undefined;
 		const updateMessage =
 			!promptOptions && recordedPrompt === undefined
 				? this._preparePromptAndToolLoadout(normalizeBuildSystemPromptOptions(this._baseSystemPromptOptions))
@@ -2824,6 +2843,8 @@ export class AgentSession {
 		source: "set" | "cycle" | "restore",
 	): Promise<void> {
 		if (modelsAreEqual(previousModel, nextModel)) return;
+		// Every model change passes here; the handshake overlaps the extension handlers below.
+		this.prewarmModelConnection();
 		await this._extensionRunner.emit({
 			type: "model_select",
 			model: nextModel,

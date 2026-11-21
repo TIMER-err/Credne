@@ -16,6 +16,7 @@ import type { ExtensionContext } from "../src/core/extensions/types.ts";
 import { createSyntheticSourceInfo } from "../src/core/source-info.ts";
 import { discoverBundledAgents } from "../src/extensions/subagent/agents.ts";
 import { captureSubagentContext } from "../src/extensions/subagent/context.ts";
+import { createSubagentDispatch } from "../src/extensions/subagent/dispatch.ts";
 import { renderParentConversation } from "../src/extensions/subagent/parent-conversation.ts";
 import { registerTeamTools } from "../src/extensions/subagent/team.ts";
 import {
@@ -70,7 +71,7 @@ describe("subagent request layout", () => {
 		const extensionsResult = await createTestExtensionsResult([
 			(pi) => {
 				registerWorkerPrompt(pi);
-				registerTeamTools(pi, async () => []);
+				registerTeamTools(pi, async () => [], createSubagentDispatch(pi));
 			},
 			createToolSearchExtension(),
 			(pi) => {
@@ -258,6 +259,7 @@ describe("subagent request layout", () => {
 				"interrupt_agent",
 				"continue_agent",
 				"steer_agent",
+				"change_agent_model",
 				"create_plan",
 				"revise_plan",
 				"review_task",

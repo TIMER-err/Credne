@@ -85,6 +85,16 @@ const NON_OVERFLOW_PATTERNS = [
 	/too many requests/i, // Generic HTTP 429 style
 ];
 
+/** Whether an error text is a known non-overflow one (throttling, rate limiting). */
+function isNonOverflowText(errorMessage: string): boolean {
+	return NON_OVERFLOW_PATTERNS.some((p) => p.test(errorMessage));
+}
+
+/** Whether an error text reads as a context overflow: it matches an overflow pattern and no non-overflow one. */
+export function isContextOverflowText(errorMessage: string): boolean {
+	return !isNonOverflowText(errorMessage) && OVERFLOW_PATTERNS.some((p) => p.test(errorMessage));
+}
+
 /**
  * Check if an assistant message represents a context overflow error.
  *
@@ -144,15 +154,15 @@ const NON_OVERFLOW_PATTERNS = [
 export function isContextOverflow(message: AssistantMessage, contextWindow?: number): boolean {
 	// Case 1: Check error message patterns
 	if (message.stopReason === "error" && message.errorMessage) {
-		// Skip messages matching known non-overflow patterns (e.g. throttling / rate-limit)
-		const isNonOverflow = NON_OVERFLOW_PATTERNS.some((p) => p.test(message.errorMessage!));
-		if (!isNonOverflow) {
-			if (OVERFLOW_PATTERNS.some((p) => p.test(message.errorMessage!))) {
-				return true;
-			}
-			if (message.provider === "cerebras" && CEREBRAS_BODYLESS_OVERFLOW_PATTERN.test(message.errorMessage)) {
-				return true;
-			}
+		if (isContextOverflowText(message.errorMessage)) {
+			return true;
+		}
+		if (
+			message.provider === "cerebras" &&
+			!isNonOverflowText(message.errorMessage) &&
+			CEREBRAS_BODYLESS_OVERFLOW_PATTERN.test(message.errorMessage)
+		) {
+			return true;
 		}
 	}
 

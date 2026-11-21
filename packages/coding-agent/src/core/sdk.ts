@@ -475,6 +475,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 	const extensionsResult = resourceLoader.getExtensions();
 
+	// The handshake overlaps the rest of startup. A no-op unless the model is served by a Claude subscription;
+	// subscription providers that extensions register later are warmed by the model change that selects them.
+	session.prewarmModelConnection();
+
 	return {
 		session,
 		extensionsResult,

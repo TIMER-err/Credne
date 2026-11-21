@@ -9,6 +9,7 @@ import { createInMemoryTransportPair } from "@earendil-works/pi-mcp/testing";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { McpExposure } from "../src/extensions/mcp/config.ts";
 import { createMcpExtension } from "../src/extensions/mcp/index.ts";
+import { createSubagentDispatch } from "../src/extensions/subagent/dispatch.ts";
 import { registerTeamTools } from "../src/extensions/subagent/team.ts";
 import { registerWorkerPrompt, WORKER_FLAG } from "../src/extensions/subagent/worker-prompt.ts";
 import { workerTools } from "../src/extensions/subagent/worker-tools.ts";
@@ -66,7 +67,7 @@ describe("subagent MCP discovery loadout", () => {
 		const extensionsResult = await createTestExtensionsResult([
 			(pi) => {
 				registerWorkerPrompt(pi);
-				registerTeamTools(pi, async () => []);
+				registerTeamTools(pi, async () => [], createSubagentDispatch(pi));
 			},
 			createToolSearchExtension(),
 			createMcpExtension({

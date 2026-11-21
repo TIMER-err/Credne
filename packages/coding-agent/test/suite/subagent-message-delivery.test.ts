@@ -27,6 +27,7 @@ vi.mock("../../src/extensions/subagent/runner.ts", async (importOriginal) => ({
 				deliveries.push({ message, mode });
 				return true;
 			},
+			setModel: async () => {},
 			dispose: async () => {},
 		};
 	},

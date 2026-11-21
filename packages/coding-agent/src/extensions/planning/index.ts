@@ -8,7 +8,7 @@ import { type AgentConfig, discoverBundledAgents } from "../subagent/agents.ts";
 import { captureSubagentContext, listSubagentContext, turnSchema } from "../subagent/context.ts";
 import { createSubagentDispatch, reasoningEffortSchema } from "../subagent/dispatch.ts";
 import { type DispatchDefaults, getFinalOutput, type SingleResult } from "../subagent/runner.ts";
-import { type AssignmentInput, getWorkerTeam, type WorkerTeam } from "../subagent/team.ts";
+import { type AssignmentInput, getWorkerTeam, revealTools, type WorkerTeam } from "../subagent/team.ts";
 import {
 	completeTask,
 	createPlan,
@@ -41,6 +41,19 @@ const toolNames = [
 	"get_subagent_context",
 	"checkpoint_context",
 ];
+// Active and callable from the start, but left out of requests until the branch enters planning.
+const PLAN_MODE_TOOLS = [
+	"create_plan",
+	"task_create",
+	"task_update",
+	"revise_plan",
+	"get_plan",
+	"assign_tasks",
+	"assign_task",
+	"cancel_tasks",
+];
+// enter_plan_mode's loadout change until the branch enters planning.
+const HIDE_PLAN_MODE_TOOLS = { hiddenDeclarations: PLAN_MODE_TOOLS };
 const revisionSchema = Type.Integer({ minimum: 1, description: "Current plan revision returned by get_plan." });
 // Codex rejects uniqueItems in tool declarations. Validate distinct IDs before changing worker state.
 const taskIdsSchema = Type.Array(Type.String(), { minItems: 1, maxItems: 4, description: "Distinct task IDs." });
@@ -55,6 +68,8 @@ interface WorkerJob {
 export default function planningExtension(pi: ExtensionAPI): void {
 	const dispatch = createSubagentDispatch(pi);
 	let plan: Plan | undefined;
+	// Whether this branch entered planning or has a plan; restore() reads it from the branch.
+	let planOpen = false;
 	let generation = 0;
 	let isTransitioning = false;
 	const jobs = new Map<string, WorkerJob>();
@@ -101,6 +116,15 @@ export default function planningExtension(pi: ExtensionAPI): void {
 		plan = next;
 		pi.appendEntry("planning-state", next);
 		if (ctx.hasUI) showPlan(next, ctx.ui);
+		// A plan made by calling create_plan directly also needs the tools that change it.
+		openPlanMode();
+	}
+
+	/** Reveals the plan tools on the first call; returns their listing for the revealing result. */
+	function openPlanMode(): string | undefined {
+		if (planOpen) return undefined;
+		planOpen = true;
+		return revealTools(pi, PLAN_MODE_TOOLS);
 	}
 
 	// The widget above the input box and the side panel section show the same plan; the widget
@@ -166,9 +190,20 @@ export default function planningExtension(pi: ExtensionAPI): void {
 		}
 		// A worker has no plan of its own; its tool allowlist leaves the planning tools undeclared.
 		if (isWorker()) return;
-		const entry = ctx.sessionManager
-			.getBranch()
-			.findLast((entry) => entry.type === "custom" && entry.customType === "planning-state");
+		const branch = ctx.sessionManager.getBranch();
+		const opened = branch.some(
+			(entry) =>
+				(entry.type === "custom" && entry.customType === "planning-state") ||
+				(entry.type === "message" &&
+					entry.message.role === "toolResult" &&
+					entry.message.toolName === "enter_plan_mode" &&
+					!entry.message.isError),
+		);
+		if (opened !== planOpen) {
+			planOpen = opened;
+			pi.setActiveTools(pi.getActiveTools());
+		}
+		const entry = branch.findLast((entry) => entry.type === "custom" && entry.customType === "planning-state");
 		if (!entry || entry.type !== "custom") return;
 		// Session entries are a disk input boundary and must pass the persisted schema.
 		if (!Value.Check(planSchema, entry.data)) {
@@ -291,9 +326,14 @@ export default function planningExtension(pi: ExtensionAPI): void {
 		description: "Use this tool proactively when you're about to start a non-trivial implementation task.",
 		parameters: Type.Object({}),
 		executionMode: "sequential",
+		prepareLoadout: () => (planOpen ? undefined : HIDE_PLAN_MODE_TOOLS),
 		async execute(_id, _args, _signal, _update, ctx) {
 			requireMain();
-			const result = snapshot();
+			const revealed = openPlanMode();
+			const snapshotResult = snapshot();
+			const result = revealed
+				? { ...snapshotResult, content: [{ type: "text" as const, text: revealed }, ...snapshotResult.content] }
+				: snapshotResult;
 			const examplesShown = ctx.sessionManager
 				.getBranch()
 				.some(

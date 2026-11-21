@@ -11,9 +11,11 @@ import {
 } from "@earendil-works/pi-tui";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { VirtualTerminal } from "../../tui/test/virtual-terminal.ts";
-import type { TuiMode } from "../src/core/settings-manager.ts";
+import { SessionManager } from "../src/core/session-manager.ts";
+import { SettingsManager, type TuiMode } from "../src/core/settings-manager.ts";
 import { createChatViewport } from "../src/modes/interactive/chat-viewport.ts";
 import type { GitOutput, GitRunner } from "../src/modes/interactive/components/git-runner.ts";
+import type { SidePanel } from "../src/modes/interactive/components/side-panel.ts";
 import {
 	reserveFullscreenColumns,
 	reserveRegularColumns,
@@ -41,9 +43,12 @@ function createHost(
 	ui: TUI,
 	reserve: (getWidth: () => number) => TranscriptReservation,
 ): SidePanelHost & { showStatus: StatusMock } {
+	const session = SessionManager.inMemory(plainDirectory);
+	const settings = SettingsManager.inMemory();
 	return {
 		ui,
-		getCwd: () => plainDirectory,
+		getSessionManager: () => session,
+		getSettingsManager: () => settings,
 		getCloseHint: () => "/diff",
 		showStatus: vi.fn<(message: string) => void>(),
 		reserveTranscriptColumns: reserve,
@@ -277,7 +282,8 @@ describe("SidePanelController in fullscreen mode", () => {
 	it("jumps from the file index to the clicked file through terminal mouse events", async () => {
 		const { terminal, tui, host } = createFullscreen(120, 30);
 		const { run } = createRepositoryRunner();
-		const controller = new SidePanelController({ ...host, getCwd: () => repositoryDirectory }, run);
+		const session = SessionManager.inMemory(repositoryDirectory);
+		const controller = new SidePanelController({ ...host, getSessionManager: () => session }, run);
 		tui.start();
 		try {
 			controller.open();
@@ -479,6 +485,7 @@ describe("InteractiveMode renderer switch with the panel open", () => {
 });
 
 const unifiedDiff = ["@@ -1,2 +1,2 @@", " keep", "-old", "+new", ""].join("\n");
+const baselineCommitId = "a".repeat(40);
 
 /** A directory that findGitPaths takes for a repository, so the controller tests can use a fake git. */
 const repositoryDirectory = mkdtempSync(join(tmpdir(), "pi-side-panel-repository-"));
@@ -502,7 +509,7 @@ function createRepositoryRunner(options: { gate?: Promise<void>; baselineGate?: 
 				await options.baselineGate;
 				return ok("");
 			}
-			if (args[0] === "rev-parse") return ok("abc123\n");
+			if (args[0] === "rev-parse") return ok(`${baselineCommitId}\n`);
 			if (args[0] === "ls-files") return ok("");
 			if (args.includes("--numstat")) {
 				await options.gate;
@@ -530,14 +537,17 @@ function createFakeUi() {
 
 function createFakeHost(ui: TUI, cwd = repositoryDirectory) {
 	const reservation = { getRows: () => 10, release: vi.fn() };
+	const session = SessionManager.inMemory(cwd);
+	const settings = SettingsManager.inMemory();
 	const host: SidePanelHost = {
 		ui,
-		getCwd: () => cwd,
+		getSessionManager: () => session,
+		getSettingsManager: () => settings,
 		getCloseHint: () => "/diff",
 		showStatus: vi.fn(),
 		reserveTranscriptColumns: vi.fn(() => reservation),
 	};
-	return { host, reservation };
+	return { host, reservation, session, settings };
 }
 
 /** Let the controller's awaited git steps finish. */
@@ -545,14 +555,133 @@ async function settle(): Promise<void> {
 	for (let turn = 0; turn < 100; turn++) await Promise.resolve();
 }
 
-/** Git calls of one capture of the baseline: stash create, the HEAD lookup, and the untracked listing. */
-const baselineGitCalls = 3;
+/** Git calls of one capture: stash create, HEAD, untracked files, and a reference retaining the snapshot. */
+const baselineGitCalls = 4;
 /** Git calls of one refresh: the file lists and each of the three files' diffs. */
 const refreshGitCalls = 5;
 
 function gitCommands(run: ReturnType<typeof createRepositoryRunner>["run"]): string[] {
 	return run.mock.calls.map(([args]) => (args.includes("--numstat") ? "numstat" : args[0]!));
 }
+
+describe("SidePanelController persistence", () => {
+	it("restores enabled state and width, and does not disable them for suspend or shutdown", async () => {
+		const { ui } = createFakeUi();
+		const { host, settings } = createFakeHost(ui, plainDirectory);
+		settings.setSidePanelEnabled(true);
+		settings.setSidePanelWidth(64);
+		const controller = new SidePanelController(host);
+		controller.beginSession();
+		expect(controller.isOpen).toBe(true);
+		expect(vi.mocked(ui.showOverlay).mock.calls[0]?.[1]?.width).toBe(64);
+		const resume = controller.suspend();
+		expect(controller.isOpen).toBe(false);
+		expect(settings.getSidePanelEnabled()).toBe(true);
+		resume();
+		controller.stop();
+		expect(settings.getSidePanelEnabled()).toBe(true);
+		await settings.flush();
+		const restartedSettings = SettingsManager.inMemory(settings.getGlobalSettings());
+		const restarted = new SidePanelController({ ...host, getSettingsManager: () => restartedSettings });
+		restarted.beginSession();
+		expect(restarted.isOpen).toBe(true);
+		expect(vi.mocked(ui.showOverlay).mock.calls.at(-1)?.[1]?.width).toBe(64);
+		restarted.close();
+		expect(restartedSettings.getSidePanelEnabled()).toBe(false);
+	});
+
+	it("persists divider drags and restores the preferred width after a restart", async () => {
+		const { terminal, tui, host } = createFullscreen(120, 16);
+		const settings = SettingsManager.inMemory();
+		const controller = new SidePanelController({ ...host, getSettingsManager: () => settings });
+		tui.start();
+		try {
+			controller.open();
+			await expectOpen(terminal, 72, "Not a git repository");
+			terminal.sendInput("\x1b[<0;73;3M");
+			terminal.sendInput("\x1b[<32;51;3M");
+			terminal.sendInput("\x1b[<0;51;3m");
+			await expectOpen(terminal, 50, "Not a git repository");
+			expect(settings.getSidePanelWidth()).toBe(70);
+			controller.stop();
+			await settings.flush();
+			const restarted = new SidePanelController({
+				...host,
+				getSettingsManager: () => settings,
+			});
+			restarted.beginSession();
+			await expectOpen(terminal, 50, "Not a git repository");
+			restarted.stop();
+		} finally {
+			controller.stop();
+			tui.stop();
+		}
+	});
+
+	it("keeps the enabled preference when restored on a narrow terminal and appears when it grows", async () => {
+		const { terminal, tui, host } = createFullscreen(80);
+		const settings = SettingsManager.inMemory({ sidePanel: { enabled: true } });
+		const controller = new SidePanelController({ ...host, getSettingsManager: () => settings });
+		tui.start();
+		try {
+			controller.beginSession();
+			await expectClosed(terminal, 80);
+			expect(settings.getSidePanelEnabled()).toBe(true);
+			terminal.resize(120, 12);
+			await expectOpen(terminal, 72, "Not a git repository");
+		} finally {
+			controller.stop();
+			tui.stop();
+		}
+	});
+
+	it("keeps the panel disabled on a new session when the saved preference is disabled", () => {
+		const { ui } = createFakeUi();
+		const { host } = createFakeHost(ui, plainDirectory);
+		const controller = new SidePanelController(host);
+		controller.beginSession();
+		expect(controller.isOpen).toBe(false);
+		expect(ui.showOverlay).not.toHaveBeenCalled();
+	});
+
+	it.each(["changes", "diff"] as const)("drops an in-flight %s result when switching sessions", async (kind) => {
+		const { ui } = createFakeUi();
+		const { host, session } = createFakeHost(ui);
+		let release = () => {};
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const { run } = createRepositoryRunner();
+		const defaults = run.getMockImplementation()!;
+		let held = false;
+		run.mockImplementation(async (...args) => {
+			if (!held && args[0].includes(kind === "changes" ? "--numstat" : "-U3")) {
+				held = true;
+				await gate;
+			}
+			return defaults(...args);
+		});
+		const controller = new SidePanelController(host, run);
+		controller.beginSession();
+		controller.open();
+		await settle();
+		expect(held).toBe(true);
+		const oldPanel = vi.mocked(ui.showOverlay).mock.calls[0]![0] as SidePanel;
+		const oldChanges = vi.spyOn(oldPanel, "setChanges");
+		const oldDiff = vi.spyOn(oldPanel, "setDiff");
+		session.newSession();
+		controller.beginSession();
+		const newPanel = vi.mocked(ui.showOverlay).mock.calls[1]![0] as SidePanel;
+		expect(newPanel).not.toBe(oldPanel);
+		const newChanges = vi.spyOn(newPanel, "setChanges");
+		release();
+		await settle();
+		expect(oldChanges).not.toHaveBeenCalled();
+		expect(oldDiff).not.toHaveBeenCalled();
+		expect(newChanges).toHaveBeenCalledWith(expect.objectContaining({ status: "ready" }));
+		controller.stop();
+	});
+});
 
 describe("SidePanelController cost", () => {
 	it("does no work while closed: no git, no timers, no rendering of sections, no layout", async () => {
@@ -585,11 +714,12 @@ describe("SidePanelController cost", () => {
 		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
 		const { run } = createRepositoryRunner();
 		const { ui, requestRender } = createFakeUi();
-		const controller = new SidePanelController(createFakeHost(ui).host, run);
+		const { host, session } = createFakeHost(ui);
+		const controller = new SidePanelController(host, run);
 
 		controller.beginSession();
 		await settle();
-		expect(gitCommands(run).sort()).toEqual(["ls-files", "rev-parse", "stash"]);
+		expect(gitCommands(run).sort()).toEqual(["ls-files", "rev-parse", "stash", "update-ref"]);
 
 		controller.handleAgentEvent("agent_end");
 		controller.handleAgentEvent("tool_execution_end");
@@ -600,6 +730,7 @@ describe("SidePanelController cost", () => {
 		expect(vi.getTimerCount()).toBe(0);
 
 		// A new session captures its own starting state.
+		session.newSession();
 		controller.beginSession();
 		await settle();
 		expect(run).toHaveBeenCalledTimes(2 * baselineGitCalls);
@@ -665,9 +796,9 @@ describe("SidePanelController cost", () => {
 
 		const numstat = run.mock.calls.find(([args]) => args.includes("--numstat"))!;
 		const fileDiff = run.mock.calls.find(([args]) => args.includes("-U3"))!;
-		expect(numstat[0]).toContain("abc123");
+		expect(numstat[0]).toContain(baselineCommitId);
 		expect(numstat[0]).not.toContain("HEAD");
-		expect(fileDiff[0].slice(-3)).toEqual(["abc123", "--", "a.ts"]);
+		expect(fileDiff[0].slice(-3)).toEqual([baselineCommitId, "--", "a.ts"]);
 		controller.close();
 	});
 
@@ -689,7 +820,7 @@ describe("SidePanelController cost", () => {
 		await settle();
 
 		expect(gitCommands(run).sort()).toEqual(
-			["diff", "diff", "diff", "ls-files", "ls-files", "numstat", "rev-parse", "stash"].sort(),
+			["diff", "diff", "diff", "ls-files", "ls-files", "numstat", "rev-parse", "stash", "update-ref"].sort(),
 		);
 		controller.close();
 	});
@@ -710,12 +841,14 @@ describe("SidePanelController cost", () => {
 		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
 		const { run } = createRepositoryRunner();
 		const { ui } = createFakeUi();
-		const controller = new SidePanelController(createFakeHost(ui).host, run);
+		const { host, session } = createFakeHost(ui);
+		const controller = new SidePanelController(host, run);
 		controller.beginSession();
 		controller.open();
 		await settle();
 		run.mockClear();
 
+		session.newSession();
 		controller.beginSession();
 		await vi.advanceTimersByTimeAsync(300);
 		await settle();

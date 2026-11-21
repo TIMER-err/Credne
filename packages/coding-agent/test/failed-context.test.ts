@@ -43,35 +43,28 @@ function mixedExchange(): Message[] {
 	];
 }
 
-describe("failure-free model context", () => {
-	it("removes only failed tool pairs without changing the saved exchange", () => {
+describe("provider failure filtering", () => {
+	it("preserves failed tool pairs without changing the saved exchange", () => {
 		const messages = mixedExchange();
 		const original = structuredClone(messages);
 		const converted = convertToLlm(messages);
-		expect(converted).toEqual([
-			messages[0],
-			{
-				...messages[1],
-				content: [
-					fauxText("Checking the files."),
-					fauxToolCall("read", { path: "existing.txt" }, { id: "good-read" }),
-				],
-			},
-			messages[3],
-		]);
+		expect(converted).toEqual(messages);
 		expect(messages).toEqual(original);
 	});
 
 	it.each(["error", "aborted"] as const)("omits %s model attempts and their tool results", (stopReason) => {
 		const messages = mixedExchange();
-		messages[1] = fauxAssistantMessage(fauxToolCall("read", {}, { id: "good-read" }), {
-			stopReason,
-			errorMessage: "Account quota exhausted",
-		});
+		messages[1] = fauxAssistantMessage(
+			[fauxToolCall("read", {}, { id: "failed-read" }), fauxToolCall("read", {}, { id: "good-read" })],
+			{
+				stopReason,
+				errorMessage: "Account quota exhausted",
+			},
+		);
 		expect(convertToLlm(messages)).toEqual([messages[0]]);
 	});
 
-	it("excludes failed worker notifications and shell executions but keeps successful reports", () => {
+	it("preserves ordinary worker failures and shell executions while excluding provider failures", () => {
 		const completed: AgentMessage = {
 			role: "custom",
 			customType: "subagent-result",
@@ -82,7 +75,7 @@ describe("failure-free model context", () => {
 		};
 		const messages: AgentMessage[] = [
 			completed,
-			{ ...completed, content: "Quota exhausted", details: { result: { status: "failed" } } },
+			{ ...completed, content: "Worker process failed", details: { result: { status: "failed" } } },
 			{
 				...completed,
 				customType: "planning-result",
@@ -99,33 +92,104 @@ describe("failure-free model context", () => {
 				timestamp: 2,
 			},
 		];
-		expect(filterFailedMessages(messages)).toEqual([completed]);
+		expect(filterFailedMessages(messages)).toEqual(messages);
+		const providerFailures: AgentMessage[] = [
+			{ ...completed, content: "Quota exhausted", details: { result: { status: "failed", stopReason: "error" } } },
+			{
+				...completed,
+				customType: "planning-result",
+				content: "No API key",
+				details: { result: { status: "failed", stopReason: "error", errorMessage: "No API key provided" } },
+			},
+		];
+		expect(filterFailedMessages(providerFailures)).toEqual([]);
 	});
 
-	it("keeps failures out of inherited context and summary file tracking", () => {
+	it.each<{ results: Record<string, string>[]; hidden: boolean }>([
+		{ results: [{ status: "failed", stopReason: "error" }], hidden: true },
+		{ results: [{ status: "failed" }], hidden: false },
+		{ results: [{ status: "aborted", stopReason: "aborted" }], hidden: false },
+		{ results: [{ status: "failed", stopReason: "error" }, { status: "completed" }], hidden: false },
+		{ results: [], hidden: false },
+	])("preserves worker tool exchanges unless every result is a provider failure: $results", ({ results, hidden }) => {
+		const messages: AgentMessage[] = [
+			{ role: "user", content: "Delegate the task", timestamp: 1 },
+			fauxAssistantMessage(fauxToolCall("subagent", {}, { id: "worker-call" }), { stopReason: "toolUse" }),
+			{
+				role: "toolResult",
+				toolName: "subagent",
+				toolCallId: "worker-call",
+				content: [{ type: "text", text: "Worker report" }],
+				details: { results },
+				isError: true,
+				timestamp: 2,
+			},
+		];
+		expect(convertToLlm(messages)).toEqual(hidden ? [messages[0]] : messages);
+	});
+
+	it("includes shell exit and cancellation diagnostics unless explicitly excluded", () => {
+		const command: AgentMessage = {
+			role: "bashExecution",
+			command: "missing-command",
+			output: "Command not found",
+			exitCode: 127,
+			cancelled: false,
+			truncated: false,
+			timestamp: 1,
+		};
+		expect(JSON.stringify(convertToLlm([command]))).toContain("Command exited with code 127");
+		expect(JSON.stringify(convertToLlm([{ ...command, cancelled: true }]))).toContain("command cancelled");
+		expect(convertToLlm([{ ...command, excludeFromContext: true }])).toEqual([]);
+	});
+
+	it("does not count failed provider output toward the compaction budget", () => {
+		const user: Message = { role: "user", content: "Continue", timestamp: 1 };
+		const messages = [
+			user,
+			fauxAssistantMessage("Partial failed output ".repeat(2000), {
+				stopReason: "error",
+				errorMessage: "Provider overloaded",
+			}),
+		];
+		const session = SessionManager.inMemory();
+		for (const message of messages) session.appendMessage(message);
+		expect(estimateContextTokens(messages).tokens).toBe(2);
+		expect(estimateProjectedContextTokens(session.buildSessionProjection(), session.getBranch()).tokens).toBe(2);
+		expect(
+			prepareCompaction(session.getEntries(), { enabled: true, keepRecentTokens: 100, reserveTokens: 0 }),
+		).toBeUndefined();
+	});
+
+	it("keeps tool failures in inherited context and summaries while excluding failed model attempts", () => {
 		const messages = mixedExchange();
 		messages.push(fauxAssistantMessage("Quota failure", { stopReason: "error" }));
 		const reference = renderParentConversation(messages);
 		expect(reference).toContain("Useful file contents");
-		expect(reference).not.toMatch(/missing\.txt|Quota failure|tool error/);
+		expect(reference).toContain("missing.txt");
+		expect(reference).toContain("[tool error] ENOENT: missing.txt");
+		expect(reference).not.toContain("Quota failure");
 
 		const session = SessionManager.inMemory();
 		for (const message of messages) session.appendMessage(message);
 		session.appendMessage({ role: "user", content: "Continue with the next task", timestamp: 4 });
 		const branch = prepareBranchEntries(session.getEntries());
-		expect([...branch.fileOps.read]).toEqual(["existing.txt"]);
-		expect(JSON.stringify(branch.messages)).not.toMatch(/missing\.txt|Quota failure/);
+		expect([...branch.fileOps.read]).toEqual(["missing.txt", "existing.txt"]);
+		expect(JSON.stringify(branch.messages)).toContain("missing.txt");
+		expect(JSON.stringify(branch.messages)).not.toContain("Quota failure");
 		const compact = prepareCompaction(session.getEntries(), {
 			enabled: true,
 			keepRecentTokens: 1,
 			reserveTokens: 0,
 		});
 		expect(compact).toBeDefined();
-		expect([...compact!.fileOps.read]).toEqual(["existing.txt"]);
-		expect(JSON.stringify(compact!.messagesToSummarize)).not.toMatch(/missing\.txt|Quota failure/);
+		expect([...compact!.fileOps.read]).toEqual(["missing.txt", "existing.txt"]);
+		const summaryMessages = [...compact!.messagesToSummarize, ...compact!.turnPrefixMessages];
+		expect(JSON.stringify(summaryMessages)).toContain("ENOENT: missing.txt");
+		expect(JSON.stringify(summaryMessages)).not.toContain("Quota failure");
 	});
 
-	it("does not spend the compaction budget on large failed exchanges", () => {
+	it("counts failed tool exchanges toward the compaction budget", () => {
 		const user: Message = { role: "user", content: "Read a file", timestamp: 1 };
 		const messages: Message[] = [
 			user,
@@ -142,14 +206,16 @@ describe("failure-free model context", () => {
 		];
 		const session = SessionManager.inMemory();
 		for (const message of messages) session.appendMessage(message);
-		expect(estimateContextTokens(messages).tokens).toBe(3);
-		expect(estimateProjectedContextTokens(session.buildSessionProjection(), session.getBranch()).tokens).toBe(3);
+		expect(estimateContextTokens(messages).tokens).toBeGreaterThan(10000);
+		expect(
+			estimateProjectedContextTokens(session.buildSessionProjection(), session.getBranch()).tokens,
+		).toBeGreaterThan(10000);
 		expect(
 			prepareCompaction(session.getEntries(), { enabled: true, keepRecentTokens: 100, reserveTokens: 0 }),
-		).toBeUndefined();
+		).toBeDefined();
 	});
 
-	it("retains tool diagnostics in the session while omitting them from the next provider request", async () => {
+	it("sends tool diagnostics to the next provider request and retains them in the session", async () => {
 		const tool: AgentTool = {
 			name: "fail",
 			label: "Fail",
@@ -160,17 +226,29 @@ describe("failure-free model context", () => {
 			},
 		};
 		const harness = await createHarness({ tools: [tool] });
+		let nextMessages: Message[] = [];
 		try {
 			harness.setResponses([
 				fauxAssistantMessage(fauxToolCall("fail", {}, { id: "failed-call" }), { stopReason: "toolUse" }),
 				(context) => {
-					expect(context.messages.filter((message) => message.role !== "system")).toEqual([
-						expect.objectContaining({ role: "user" }),
-					]);
+					nextMessages = context.messages;
 					return fauxAssistantMessage("Finished");
 				},
 			]);
 			await harness.session.prompt("Run the task");
+			expect(nextMessages.filter((message) => message.role !== "system")).toEqual([
+				expect.objectContaining({ role: "user" }),
+				expect.objectContaining({
+					role: "assistant",
+					content: [expect.objectContaining({ type: "toolCall", id: "failed-call" })],
+				}),
+				expect.objectContaining({
+					role: "toolResult",
+					toolCallId: "failed-call",
+					isError: true,
+					content: [{ type: "text", text: "Tool transport unavailable" }],
+				}),
+			]);
 			expect(harness.session.messages).toContainEqual(
 				expect.objectContaining({ role: "toolResult", toolCallId: "failed-call", isError: true }),
 			);
@@ -226,58 +304,6 @@ describe("failure-free model context", () => {
 		}
 	});
 
-	it("honors a boundary continuation from a failed raw assistant tail", async () => {
-		const harness = await createHarness({
-			settings: { retry: { enabled: false } },
-			extensionFactories: [
-				(pi) => {
-					pi.on("agent_before_settle", (event) => {
-						if (event.outcome === "error") return { continue: true };
-					});
-				},
-			],
-		});
-		let continuedMessages: Message[] = [];
-		try {
-			harness.setResponses([
-				fauxAssistantMessage([], { stopReason: "error", errorMessage: "Insufficient credits" }),
-				(context) => {
-					continuedMessages = context.messages.filter((message) => message.role !== "system");
-					return fauxAssistantMessage("Recovered");
-				},
-			]);
-			await harness.session.prompt("Run the task");
-			expect(continuedMessages).toEqual([
-				expect.objectContaining({ role: "user", content: [fauxText("Run the task")] }),
-			]);
-			expect(harness.faux.state.callCount).toBe(2);
-		} finally {
-			harness.cleanup();
-		}
-	});
-
-	it("offers continuation only on the reopened failed branch until it is dismissed", async () => {
-		const manager = SessionManager.inMemory();
-		manager.appendMessage({ role: "user", content: "Completed branch", timestamp: 1 });
-		const completedId = manager.appendMessage(fauxAssistantMessage("Complete"));
-		manager.appendMessage({ role: "user", content: "Retry this", timestamp: 2 });
-		const failedId = manager.appendMessage(fauxAssistantMessage([], { stopReason: "error" }));
-		const harness = await createHarness({ sessionManager: manager });
-		harness.session.refreshContext();
-		try {
-			expect(harness.session.canContinueInterruptedRun).toBe(true);
-			await harness.session.navigateTree(completedId);
-			expect(await harness.session.continueInterruptedRun()).toBe("nothing-to-continue");
-			await harness.session.navigateTree(failedId);
-			expect(harness.session.canContinueInterruptedRun).toBe(true);
-			harness.session.dismissInterruptedRun();
-			expect(await harness.session.continueInterruptedRun()).toBe("nothing-to-continue");
-			expect(harness.faux.state.callCount).toBe(0);
-		} finally {
-			harness.cleanup();
-		}
-	});
-
 	it.each([true, false])("after compaction, resumes only if the original prompt was retained (%s)", async (kept) => {
 		const manager = SessionManager.inMemory();
 		const userId = manager.appendMessage({ role: "user", content: "Retry this original prompt", timestamp: 1 });
@@ -294,88 +320,31 @@ describe("failure-free model context", () => {
 		}
 	});
 
-	it("continues an interrupted tool batch from its completed result without running the tool again", async () => {
-		const toolStarted = Promise.withResolvers<void>();
-		let completedCalls = 0;
-		const parameters = Type.Object({ wait: Type.Boolean() });
-		const tool: AgentTool<typeof parameters> = {
-			name: "checked",
-			label: "Checked",
-			description: "Record completed and interrupted calls",
-			parameters,
-			execute: async (_id, args, signal) => {
-				if (args.wait) {
-					toolStarted.resolve();
-					await new Promise<void>((resolve) => signal?.addEventListener("abort", () => resolve(), { once: true }));
-					throw new Error("Operation aborted");
-				}
-				completedCalls++;
-				return { content: [fauxText("Completed once")], details: undefined };
-			},
-		};
-		// The harness erases tool types; the agent validates arguments against parameters before execute.
-		const harness = await createHarness({ tools: [tool as AgentTool] });
-		harness.session.agent.toolExecution = "sequential";
-		let continuedMessages: Message[] = [];
-		try {
-			harness.setResponses([
-				fauxAssistantMessage(
-					[
-						fauxToolCall("checked", { wait: false }, { id: "completed" }),
-						fauxToolCall("checked", { wait: true }, { id: "interrupted" }),
-					],
-					{ stopReason: "toolUse" },
-				),
-			]);
-			const run = harness.session.prompt("Check both files");
-			await toolStarted.promise;
-			expect(await harness.session.continueInterruptedRun()).toBe("busy");
-			await harness.session.abort();
-			await run;
-			harness.setResponses([
-				(context) => {
-					continuedMessages = context.messages.filter((message) => message.role !== "system");
-					return fauxAssistantMessage("Recovered");
-				},
-			]);
-			expect(await harness.session.continueInterruptedRun()).toBe("continued");
-			expect(continuedMessages).toEqual([
-				expect.objectContaining({ role: "user" }),
-				expect.objectContaining({
-					role: "assistant",
-					content: [expect.objectContaining({ type: "toolCall", id: "completed" })],
-				}),
-				expect.objectContaining({
-					role: "toolResult",
-					toolCallId: "completed",
-					content: [fauxText("Completed once")],
-				}),
-			]);
-			expect(completedCalls).toBe(1);
-		} finally {
-			harness.cleanup();
-		}
-	});
-
-	it("does not replay exhausted-account responses after the user continues", async () => {
-		const harness = await createHarness({ settings: { retry: { enabled: false } } });
-		try {
-			harness.setResponses([
-				fauxAssistantMessage("Partial failed answer", { stopReason: "error", errorMessage: "Quota exhausted" }),
-				(context) => {
-					expect(
-						context.messages.filter((message) => message.role !== "system").map((message) => message.role),
-					).toEqual(["user", "user"]);
-					return fauxAssistantMessage("Recovered");
-				},
-			]);
-			await harness.session.prompt("First attempt");
-			await harness.session.prompt("Continue");
-			expect(harness.session.messages).toContainEqual(
-				expect.objectContaining({ role: "assistant", stopReason: "error", errorMessage: "Quota exhausted" }),
-			);
-		} finally {
-			harness.cleanup();
-		}
-	});
+	it.each(["Quota exhausted", "No API key provided", "Server is at capacity", "Provider overloaded"])(
+		"does not replay provider failures after continuing: %s",
+		async (errorMessage) => {
+			const harness = await createHarness({ settings: { retry: { enabled: false } } });
+			let nextMessages: Message[] = [];
+			try {
+				harness.setResponses([
+					fauxAssistantMessage("Partial failed answer", { stopReason: "error", errorMessage }),
+					(context) => {
+						nextMessages = context.messages;
+						return fauxAssistantMessage("Recovered");
+					},
+				]);
+				await harness.session.prompt("First attempt");
+				await harness.session.prompt("Continue");
+				expect(nextMessages.filter((message) => message.role !== "system").map((message) => message.role)).toEqual([
+					"user",
+					"user",
+				]);
+				expect(harness.session.messages).toContainEqual(
+					expect.objectContaining({ role: "assistant", stopReason: "error", errorMessage }),
+				);
+			} finally {
+				harness.cleanup();
+			}
+		},
+	);
 });

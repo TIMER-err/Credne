@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
 import type { ExtensionAPI, ExtensionContext } from "../../core/extensions/types.ts";
-import { ACCOUNT_PROVIDER_PREFIX, POOL_PROVIDER_PREFIX } from "../accounts/catalog.ts";
+import { isBrokerProvider } from "../accounts/catalog.ts";
 import { PARENT_CONVERSATION_TAG } from "./parent-conversation.ts";
 import type { RequestParent } from "./worker-channel.ts";
 
@@ -89,10 +89,11 @@ function preparePayload(
 	identity: CacheIdentity | undefined,
 ): { payload: unknown; identity?: CacheIdentity } | undefined {
 	if (Value.Check(anthropicPayloadSchema, payload)) {
-		const provider = ctx.model?.provider ?? "";
-		const isBroker = provider.startsWith(ACCOUNT_PROVIDER_PREFIX) || provider.startsWith(POOL_PROVIDER_PREFIX);
+		const isBroker = isBrokerProvider(ctx.model?.provider ?? "");
 		// CLIProxyAPI otherwise injects its own markers and can evict the shared conversation
-		// boundary. This supported proxy option is consumed before the upstream HTTP request.
+		// boundary. This supported proxy option is consumed before the upstream HTTP request. Only the broker
+		// understands it: Anthropic rejects the field, so local subscriptions (`claude-sub:`) and virtual pools,
+		// whose requests may go to either, never get it.
 		const request = isBroker
 			? { ...payload, prompt_cache_options: { ...payload.prompt_cache_options, mode: "explicit" } }
 			: payload;

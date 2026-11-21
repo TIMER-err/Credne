@@ -9,7 +9,7 @@ import { CONFIG_DIR_NAME, getAgentDir } from "../config.ts";
 import { normalizePath, resolvePath } from "../utils/paths.ts";
 import { stripBom } from "../utils/text.ts";
 import { DEFAULT_HTTP_IDLE_TIMEOUT_MS, parseHttpIdleTimeoutMs } from "./http-dispatcher.ts";
-import { SETTINGS_DEFAULTS } from "./settings-defaults.ts";
+import { SETTINGS_DEFAULTS, SIDE_PANEL_WIDTH_PERCENT_PATTERN } from "./settings-defaults.ts";
 import type {
 	CacheWarmingMode,
 	CompactionModelOverride,
@@ -57,6 +57,9 @@ const DEFAULT_COMPACTION_TOKEN_SETTINGS: Required<CompactionModelOverride> = {
 	reserveTokens: SETTINGS_DEFAULTS.compaction.reserveTokens,
 	keepRecentTokens: SETTINGS_DEFAULTS.compaction.keepRecentTokens,
 };
+
+const sidePanelWidthPercentage = new RegExp(SIDE_PANEL_WIDTH_PERCENT_PATTERN);
+type SidePanelWidth = { unit: "percent"; value: number } | { unit: "columns"; value: number };
 
 function isMergeableObject(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -1273,6 +1276,44 @@ export class SettingsManager {
 		}
 		this.globalSettings.terminal.showTerminalProgress = enabled;
 		this.markModified("terminal", "showTerminalProgress");
+		this.save();
+	}
+
+	/** Global UI preference, unaffected by project settings. Settings files are an unvalidated input boundary. */
+	getSidePanelEnabled(): boolean {
+		const enabled = this.globalSettings.sidePanel?.enabled;
+		return typeof enabled === "boolean" ? enabled : SETTINGS_DEFAULTS.sidePanel.enabled;
+	}
+
+	setSidePanelEnabled(enabled: boolean): void {
+		this.globalSettings.sidePanel ??= {};
+		this.globalSettings.sidePanel.enabled = enabled;
+		this.markModified("sidePanel", "enabled");
+		this.save();
+	}
+
+	/** Read the global preferred width, ignoring malformed values from settings files. */
+	getSidePanelWidth(): SidePanelWidth | undefined {
+		const width = this.globalSettings.sidePanel?.width;
+		if (typeof width === "string" && sidePanelWidthPercentage.test(width)) {
+			return { unit: "percent", value: Number.parseFloat(width) };
+		}
+		if (typeof width === "number" && Number.isSafeInteger(width) && width > 0) {
+			return { unit: "columns", value: width };
+		}
+		return undefined;
+	}
+
+	/** Save a share of terminal width, replacing any legacy column setting. */
+	setSidePanelWidthPercent(widthPercent: number): void {
+		this.setSidePanelWidth(`${widthPercent}%`);
+	}
+
+	/** Save a width setting. Numeric values are legacy columns and migrate when the panel is shown. */
+	setSidePanelWidth(width: number | `${number}%`): void {
+		this.globalSettings.sidePanel ??= {};
+		this.globalSettings.sidePanel.width = width;
+		this.markModified("sidePanel", "width");
 		this.save();
 	}
 

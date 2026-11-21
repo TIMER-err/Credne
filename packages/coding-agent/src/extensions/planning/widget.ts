@@ -96,6 +96,7 @@ export class PlanningWidget implements Component {
  * the plan is replaced as a whole on every change, and the widget's spinner supplies the frames.
  */
 export class PlanningSection implements Component {
+	readonly stickyHeader = true;
 	private readonly plan: Plan;
 	private readonly theme: Theme;
 	private readonly spinner: ActivitySpinner;

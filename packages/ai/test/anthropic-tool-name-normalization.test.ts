@@ -1,33 +1,53 @@
 import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
 import { getModel, stream } from "../src/compat.ts";
-import type { Context, Tool } from "../src/types.ts";
+import type { AssistantMessage, Context, Tool, ToolResultMessage } from "../src/types.ts";
 import { resolveApiKey } from "./oauth.ts";
 
 const oauthToken = await resolveApiKey("anthropic");
 
 /**
- * Tests for Anthropic OAuth tool name normalization.
+ * Tests for Anthropic OAuth tool name prefixing.
  *
- * When using Claude Code OAuth, tool names must match CC's canonical casing.
- * The normalization should:
- * 1. Convert tool names that match CC tools (case-insensitive) to CC casing on outbound
- * 2. Convert tool names back to the original casing on inbound
+ * With a subscription (OAuth) token the request mimics Claude Code, so every client tool is sent with a
+ * wire-only `_` prefix that keeps it apart from Claude Code's own tools (`_read`, `_todowrite`, ...), except
+ * Anthropic's built-in tools (`web_search`, `code_execution`, `text_editor`, `computer`). The prefix is
+ * removed again from tool calls in the response, so callers only ever see the names they defined.
  *
- * This is a simple case-insensitive lookup, NOT a mapping of different names.
- * e.g., "todowrite" -> "TodoWrite" -> "todowrite" (round-trip works)
- *
- * The old `find -> Glob` mapping was WRONG because:
- * - Outbound: "find" -> "Glob"
- * - Inbound: "Glob" -> ??? (no tool named "glob" in context.tools, only "find")
- * - Result: tool call has name "Glob" but no tool exists with that name
+ * There is no Claude Code casing map: `todowrite` is sent as `_todowrite`, never as `TodoWrite`, and `find`
+ * is never renamed to `Glob`. Names the model returns must round-trip to exactly the original name.
  */
-describe.skipIf(!oauthToken)("Anthropic OAuth tool name normalization", () => {
+describe.skipIf(!oauthToken)("Anthropic OAuth tool name prefixing", () => {
 	const model = getModel("anthropic", "claude-sonnet-4-6");
 
-	it("should normalize user-defined tool matching CC name (todowrite -> TodoWrite -> todowrite)", async () => {
-		// User defines a tool named "todowrite" (lowercase)
-		// CC has "TodoWrite" - this should round-trip correctly
+	function userContext(systemPrompt: string, prompt: string, tools: Tool[]): Context {
+		return { systemPrompt, messages: [{ role: "user", content: prompt, timestamp: Date.now() }], tools };
+	}
+
+	/** Every tool call the model made must carry exactly the name the caller defined, never a wire form. */
+	function expectOnlyToolCallName(toolCallNames: string[], expected: string): void {
+		expect(toolCallNames.length).toBeGreaterThan(0);
+		expect(toolCallNames.filter((name) => name !== expected)).toEqual([]);
+	}
+
+	async function runToolCall(context: Context): Promise<{ response: AssistantMessage; toolCallNames: string[] }> {
+		const s = stream(model, context, { apiKey: oauthToken });
+		const toolCallNames: string[] = [];
+
+		for await (const event of s) {
+			if (event.type !== "toolcall_end") continue;
+			const toolCall = event.partial.content[event.contentIndex];
+			if (toolCall.type === "toolCall") toolCallNames.push(toolCall.name);
+		}
+
+		const response = await s.result();
+		expect(response.stopReason, `Error: ${response.errorMessage}`).toBe("toolUse");
+		return { response, toolCallNames };
+	}
+
+	it("decodes a tool named like a Claude Code tool back to its own name (todowrite)", async () => {
+		// Claude Code has "TodoWrite". The tool is sent as "_todowrite" and must come back as "todowrite",
+		// not "TodoWrite" and not "_todowrite".
 		const todoTool: Tool = {
 			name: "todowrite",
 			description: "Write a todo item",
@@ -36,39 +56,20 @@ describe.skipIf(!oauthToken)("Anthropic OAuth tool name normalization", () => {
 			}),
 		};
 
-		const context: Context = {
-			systemPrompt: "You are a helpful assistant. Use the todowrite tool when asked to add todos.",
-			messages: [
-				{
-					role: "user",
-					content: "Add a todo: buy milk. Use the todowrite tool.",
-					timestamp: Date.now(),
-				},
-			],
-			tools: [todoTool],
-		};
+		const { toolCallNames } = await runToolCall(
+			userContext(
+				"You are a helpful assistant. Use the todowrite tool when asked to add todos.",
+				"Add a todo: buy milk. Use the todowrite tool.",
+				[todoTool],
+			),
+		);
 
-		const s = stream(model, context, { apiKey: oauthToken });
-		let toolCallName: string | undefined;
-
-		for await (const event of s) {
-			if (event.type === "toolcall_end") {
-				const toolCall = event.partial.content[event.contentIndex];
-				if (toolCall.type === "toolCall") {
-					toolCallName = toolCall.name;
-				}
-			}
-		}
-
-		const response = await s.result();
-		expect(response.stopReason, `Error: ${response.errorMessage}`).toBe("toolUse");
-
-		// The tool call should come back with the ORIGINAL name "todowrite", not "TodoWrite"
-		expect(toolCallName).toBe("todowrite");
+		expectOnlyToolCallName(toolCallNames, "todowrite");
 	});
 
-	it("should handle pi's built-in tools (read, write, edit, bash)", async () => {
-		// Pi's tools use lowercase names, CC uses PascalCase
+	it("decodes pi's built-in tools (read, write, edit, bash) back to lowercase names", async () => {
+		// Pi's tools use lowercase names and Claude Code's use PascalCase; neither side is renamed, the wire
+		// name is just "_read" and the response is decoded back to "read".
 		const readTool: Tool = {
 			name: "read",
 			description: "Read a file",
@@ -77,41 +78,21 @@ describe.skipIf(!oauthToken)("Anthropic OAuth tool name normalization", () => {
 			}),
 		};
 
-		const context: Context = {
-			systemPrompt: "You are a helpful assistant. Use the read tool to read files.",
-			messages: [
-				{
-					role: "user",
-					content: "Read the file /tmp/test.txt using the read tool.",
-					timestamp: Date.now(),
-				},
-			],
-			tools: [readTool],
-		};
+		const { toolCallNames } = await runToolCall(
+			userContext(
+				"You are a helpful assistant. Use the read tool to read files.",
+				"Read the file /tmp/test.txt using the read tool.",
+				[readTool],
+			),
+		);
 
-		const s = stream(model, context, { apiKey: oauthToken });
-		let toolCallName: string | undefined;
-
-		for await (const event of s) {
-			if (event.type === "toolcall_end") {
-				const toolCall = event.partial.content[event.contentIndex];
-				if (toolCall.type === "toolCall") {
-					toolCallName = toolCall.name;
-				}
-			}
-		}
-
-		const response = await s.result();
-		expect(response.stopReason, `Error: ${response.errorMessage}`).toBe("toolUse");
-
-		// The tool call should come back with the ORIGINAL name "read", not "Read"
-		expect(toolCallName).toBe("read");
+		expectOnlyToolCallName(toolCallNames, "read");
 	});
 
-	it("should NOT map find to Glob - find is not a CC tool name", async () => {
-		// Pi has a "find" tool, CC has "Glob" - these are DIFFERENT tools
-		// The old code incorrectly mapped find -> Glob, which broke the round-trip
-		// because there's no tool named "glob" in context.tools
+	it("keeps find as find - it is not mapped to Glob", async () => {
+		// Pi has a "find" tool and Claude Code has "Glob". They are different tools: the wire name is "_find"
+		// and the decoded name must be "find". A find -> Glob mapping would come back as "Glob" and match no
+		// tool in context.tools.
 		const findTool: Tool = {
 			name: "find",
 			description: "Find files by pattern",
@@ -120,49 +101,18 @@ describe.skipIf(!oauthToken)("Anthropic OAuth tool name normalization", () => {
 			}),
 		};
 
-		const context: Context = {
-			systemPrompt: "You are a helpful assistant. Use the find tool to search for files.",
-			messages: [
-				{
-					role: "user",
-					content: "Find all .ts files using the find tool.",
-					timestamp: Date.now(),
-				},
-			],
-			tools: [findTool],
-		};
+		const { toolCallNames } = await runToolCall(
+			userContext(
+				"You are a helpful assistant. Use the find tool to search for files.",
+				"Find all .ts files using the find tool.",
+				[findTool],
+			),
+		);
 
-		const s = stream(model, context, { apiKey: oauthToken });
-		let toolCallName: string | undefined;
-
-		for await (const event of s) {
-			if (event.type === "toolcall_end") {
-				const toolCall = event.partial.content[event.contentIndex];
-				if (toolCall.type === "toolCall") {
-					toolCallName = toolCall.name;
-				}
-			}
-		}
-
-		const response = await s.result();
-		expect(response.stopReason, `Error: ${response.errorMessage}`).toBe("toolUse");
-
-		// With the BROKEN find -> Glob mapping:
-		// - Sent as "Glob" to Anthropic
-		// - Received back as "Glob"
-		// - fromClaudeCodeName("Glob", tools) looks for tool.name.toLowerCase() === "glob"
-		// - No match (tool is named "find"), returns "Glob"
-		// - Test fails: toolCallName is "Glob" instead of "find"
-		//
-		// With the CORRECT implementation (no find->Glob mapping):
-		// - Sent as "find" to Anthropic (no CC tool named "Find")
-		// - Received back as "find"
-		// - Test passes: toolCallName is "find"
-		expect(toolCallName).toBe("find");
+		expectOnlyToolCallName(toolCallNames, "find");
 	});
 
-	it("should handle custom tools that don't match any CC tool names", async () => {
-		// A completely custom tool should pass through unchanged
+	it("decodes custom tools that match no Claude Code tool name", async () => {
 		const customTool: Tool = {
 			name: "my_custom_tool",
 			description: "A custom tool",
@@ -171,34 +121,73 @@ describe.skipIf(!oauthToken)("Anthropic OAuth tool name normalization", () => {
 			}),
 		};
 
-		const context: Context = {
-			systemPrompt: "You are a helpful assistant. Use my_custom_tool when asked.",
-			messages: [
-				{
-					role: "user",
-					content: "Use my_custom_tool with input 'hello'.",
-					timestamp: Date.now(),
-				},
-			],
-			tools: [customTool],
+		const { toolCallNames } = await runToolCall(
+			userContext(
+				"You are a helpful assistant. Use my_custom_tool when asked.",
+				"Use my_custom_tool with input 'hello'.",
+				[customTool],
+			),
+		);
+
+		expectOnlyToolCallName(toolCallNames, "my_custom_tool");
+	});
+
+	it("removes only one prefix from a tool whose own name starts with an underscore", async () => {
+		// "_private_tool" is sent as "__private_tool"; stripping exactly one "_" restores the original name.
+		const privateTool: Tool = {
+			name: "_private_tool",
+			description: "A tool whose name starts with an underscore",
+			parameters: Type.Object({
+				input: Type.String({ description: "Input value" }),
+			}),
 		};
 
-		const s = stream(model, context, { apiKey: oauthToken });
-		let toolCallName: string | undefined;
+		const { toolCallNames } = await runToolCall(
+			userContext(
+				"You are a helpful assistant. Use _private_tool when asked.",
+				"Use _private_tool with input 'hello'.",
+				[privateTool],
+			),
+		);
 
-		for await (const event of s) {
-			if (event.type === "toolcall_end") {
-				const toolCall = event.partial.content[event.contentIndex];
-				if (toolCall.type === "toolCall") {
-					toolCallName = toolCall.name;
-				}
-			}
-		}
+		expectOnlyToolCallName(toolCallNames, "_private_tool");
+	});
 
-		const response = await s.result();
-		expect(response.stopReason, `Error: ${response.errorMessage}`).toBe("toolUse");
+	it("sends the decoded tool call back with the same wire prefix on the next turn", async () => {
+		// The assistant tool call and its result are replayed in history. If history carried "read" while the
+		// tool list carried "_read", the second request would be rejected or the model would lose the call.
+		const readTool: Tool = {
+			name: "read",
+			description: "Read a file",
+			parameters: Type.Object({
+				path: Type.String({ description: "File path" }),
+			}),
+		};
+		const context = userContext(
+			"You are a helpful assistant. Use the read tool to read files, then answer in one short sentence.",
+			"Read the file /tmp/test.txt using the read tool.",
+			[readTool],
+		);
 
-		// Custom tool names should pass through unchanged
-		expect(toolCallName).toBe("my_custom_tool");
+		const first = await runToolCall(context);
+		const toolCall = first.response.content.find((block) => block.type === "toolCall");
+		expect(toolCall).toMatchObject({ type: "toolCall", name: "read" });
+		if (toolCall?.type !== "toolCall") throw new Error("Expected a tool call");
+		const toolResult: ToolResultMessage = {
+			role: "toolResult",
+			toolCallId: toolCall.id,
+			toolName: toolCall.name,
+			content: [{ type: "text", text: "hello from the file" }],
+			isError: false,
+			timestamp: Date.now(),
+		};
+
+		const second = await stream(
+			model,
+			{ ...context, messages: [...context.messages, first.response, toolResult] },
+			{ apiKey: oauthToken },
+		).result();
+
+		expect(second.stopReason, `Error: ${second.errorMessage}`).not.toBe("error");
 	});
 });

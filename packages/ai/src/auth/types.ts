@@ -246,6 +246,12 @@ export interface OAuthAuth {
 	 * can load the implementation on first use.
 	 */
 	toAuth(credential: OAuthCredential): Promise<ModelAuth>;
+
+	/**
+	 * Optional side-effect-free derivation of provider env values from a valid credential, merged into the
+	 * request's `env`. Carries per-credential request identity such as Anthropic's account uuid.
+	 */
+	toEnv?(credential: OAuthCredential): Promise<ProviderEnv | undefined>;
 }
 
 /**

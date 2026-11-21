@@ -28,17 +28,17 @@ The startup header lists the instructions and resources Pi loaded. Warnings star
 
 The footer's cost and cache-hit rate (`CH`) combine recorded usage from the main agent and every subagent across the entire session. The rate divides total cache-read tokens by total input, cache-read, and cache-write tokens. Context-window usage still describes the main agent's current context.
 
-Failed model responses, failed tool call/result pairs, failed worker notifications, and failed shell executions stay visible in the transcript but are omitted from subsequent model requests, new summaries, and inherited subagent context.
+Failed provider attempts, including exhausted credits, usage limits, authentication errors, and capacity errors, stay visible in the transcript but are omitted from subsequent model requests, new summaries, and inherited subagent context. Ordinary tool failures, failed shell commands, and worker execution failures remain in model context so the agent can respond to their diagnostics.
 
 Pi does not ask before every tool call. Review commands and changed files, and use a sandbox for untrusted or unattended work. See [Security](security.md).
 
 ## Review changed files
 
-Run `/diff` to open or close the side panel. Its file index and diff view have separate reserved heights. Each file has a heading followed by its additions, deletions, and context, so a binary file does not replace the diffs of later text files.
+Run `/diff` to open or close the side panel. The panel needs at least 80 terminal columns and takes 40% of the width by default. In fullscreen mode, drag the vertical divider to resize it while the input dock stays full width. The chosen percentage is limited to 25–60% and saved across launches. Saved widths in columns are converted to a percentage when the panel is first shown. See [`sidePanel.width`](settings.md#terminal-and-display).
 
-In fullscreen mode, drag the vertical divider to resize the panel while the input dock stays full width. The chosen width lasts until the application exits, including after closing and reopening the panel. Scroll over the file index to browse paths without moving the diff view. Click a file to jump to its diff. Scroll over the diff view to continue through all files, or use `Alt+PageUp` and `Alt+PageDown`. The next/previous file shortcuts are `Alt+Down`/`Alt+Up` on Windows and WSL, or `Ctrl+Alt+Down`/`Ctrl+Alt+Up` elsewhere. These shortcuts are configurable through the `app.sidePanel.*` actions. Long extension sections above the changes also scroll under the mouse and leave room for the diff.
+Tasks, Agents, the file index, and the diff each have their own scrolling area when visible. Put the pointer over the list or diff you want to scroll without moving the others. Click a file to jump to its diff. Use `Alt+PageUp` and `Alt+PageDown` to scroll the diff by a page. The next/previous file shortcuts are `Alt+Down`/`Alt+Up` on Windows and WSL, or `Ctrl+Alt+Down`/`Ctrl+Alt+Up` elsewhere. These shortcuts are configurable through the `app.sidePanel.*` actions.
 
-The panel needs at least 100 terminal columns. It shows changes since the session started, falling back to the last commit if a starting snapshot cannot be captured. Existing file-count and large-diff limits are reported in the panel.
+The panel shows changes since the session started, falling back to the last commit if a starting snapshot cannot be captured. Each file has its own heading, so a binary file does not replace the diffs of later text files. Existing file-count and large-diff limits are reported in the panel.
 
 ## Change direction
 

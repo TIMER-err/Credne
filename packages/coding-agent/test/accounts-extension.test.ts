@@ -22,7 +22,7 @@ import {
 } from "../src/extensions/accounts/catalog.ts";
 import { type BrokerAccount, BrokerClient, type BrokerModel } from "../src/extensions/accounts/client.ts";
 import accountsExtension from "../src/extensions/accounts/index.ts";
-import { type AccountProviderSpec, createAccountProvider, providerSpecs } from "../src/extensions/accounts/provider.ts";
+import { type BrokerProviderSpec, createAccountProvider, providerSpecs } from "../src/extensions/accounts/provider.ts";
 import { initTheme, theme } from "../src/modes/interactive/theme/theme.ts";
 import { openBrowser } from "../src/utils/open-browser.ts";
 
@@ -66,13 +66,8 @@ function account(overrides: Partial<BrokerAccount> & Pick<BrokerAccount, "id" | 
 	};
 }
 
-const claudeA = account({
-	id: "claude-aaaa-a@example.com.json",
-	provider: "claude",
-	email: "a@example.com",
-	plan: "max",
-});
-const claudeB = account({ id: "claude-bbbb-b@example.com.json", provider: "claude", email: "b@example.com" });
+const claudeA = account({ id: "claude-api-aaaa-a.json", provider: "claude-api", kind: "api-key", label: "a" });
+const claudeB = account({ id: "claude-api-bbbb-b.json", provider: "claude-api", kind: "api-credits", label: "b" });
 const codexC = account({ id: "codex-cccc-c@example.com-plus.json", provider: "codex", email: "c@example.com" });
 const claudeModel: BrokerModel = {
 	id: "claude-test-1",
@@ -82,14 +77,14 @@ const claudeModel: BrokerModel = {
 };
 const codexModel: BrokerModel = { id: "gpt-test", thinking: true, inputModalities: ["text", "image"] };
 
-function spec(id: string): AccountProviderSpec {
+function spec(id: string): BrokerProviderSpec {
 	const found = providerSpecs(testCatalog()).find((entry) => entry.id === id);
 	if (!found) throw new Error(`no provider ${id}`);
 	return found;
 }
 
-const ACCT_A = "acct:claude-aaaa-a@example.com";
-const ACCT_B = "acct:claude-bbbb-b@example.com";
+const ACCT_A = "acct:claude-api-aaaa-a";
+const ACCT_B = "acct:claude-api-bbbb-b";
 const ACCT_C = "acct:codex-cccc-c@example.com-plus";
 
 function testCatalog(): AccountCatalog {
@@ -286,12 +281,13 @@ describe("account catalog", () => {
 	it("maps each account to a provider on Pi's native adapter for its upstream", () => {
 		const catalog = testCatalog();
 		const specs = providerSpecs(catalog);
-		expect(specs.map((entry) => entry.id)).toEqual(["pool:all", "pool:claude", "pool:codex", ACCT_A, ACCT_B, ACCT_C]);
+		// The virtual pools pool:claude and pool:all are not the broker's; they span these accounts and local subscriptions.
+		expect(specs.map((entry) => entry.id)).toEqual(["pool:codex", ACCT_A, ACCT_B, ACCT_C]);
 		const [claude] = catalog.accounts[0]!.models;
 		expect(claude).toMatchObject({
 			id: "claude-test-1",
 			api: "anthropic-messages",
-			provider: "acct:claude-aaaa-a@example.com",
+			provider: ACCT_A,
 			baseUrl: BROKER_PLACEHOLDER_URL,
 			reasoning: true,
 			contextWindow: 200_000,
@@ -301,17 +297,45 @@ describe("account catalog", () => {
 		});
 		expect(catalog.accounts[2]!.models[0]).toMatchObject({ api: "openai-responses", input: ["text", "image"] });
 		expect(catalog.pools.map(({ name, accountCount }) => ({ name, accountCount }))).toEqual([
-			{ name: "all", accountCount: 3 },
-			{ name: "claude", accountCount: 2 },
 			{ name: "codex", accountCount: 1 },
 		]);
-		expect(spec(ACCT_A).name).toBe("Claude · a@example.com (max)");
-		expect(spec("pool:all").name).toBe("All accounts pool (3 accounts)");
-		// The combined pool lists every family's models, each on its own API.
-		expect(spec("pool:all").models.map((model) => [model.id, model.api, model.provider])).toEqual([
-			["claude-test-1", "anthropic-messages", "pool:all"],
-			["gpt-test", "openai-responses", "pool:all"],
-		]);
+		expect(spec(ACCT_A).name).toBe("Claude · a (API key)");
+		expect(spec("pool:codex").name).toBe("ChatGPT Codex pool (1 account)");
+	});
+
+	it("leaves Claude subscriptions to this process, in new and in older catalog files", () => {
+		const subscription = account({
+			id: "claude-aaaa-sub@example.com.json",
+			provider: "claude",
+			email: "sub@example.com",
+		});
+		const catalog = buildCatalog(
+			[subscription, claudeA],
+			new Map([
+				[subscription.key, [claudeModel]],
+				[claudeA.key, [claudeModel]],
+			]),
+			() => undefined,
+		);
+		expect(catalog.accounts.map((entry) => entry.id)).toEqual([claudeA.id]);
+		expect(catalog.pools).toEqual([]);
+
+		const path = join(tempDir(), "catalog.json");
+		writeCatalog(path, {
+			version: 2,
+			accounts: [
+				{ ...catalog.accounts[0]!, id: subscription.id, key: subscription.key, provider: "claude", kind: "oauth" },
+				...catalog.accounts,
+			],
+			pools: [
+				{ name: "claude", accountCount: 1, models: [] },
+				{ name: "all", accountCount: 1, models: [] },
+				{ name: "codex", accountCount: 1, models: [] },
+			],
+		});
+		const read = readCatalog(path);
+		expect(read.accounts.map((entry) => entry.id)).toEqual([claudeA.id]);
+		expect(read.pools.map((entry) => entry.name)).toEqual(["codex"]);
 	});
 
 	it("reuses Pi's catalog metadata for known models", () => {
@@ -369,6 +393,10 @@ describe("accounts extension", () => {
 		expect(runtime.pendingNativeProviderRegistrations.map((entry) => entry.provider.id)).toEqual(
 			providerSpecs(testCatalog()).map((spec) => spec.id),
 		);
+		// The Claude pools are virtual models of the same provider ids, one per model of their accounts.
+		expect(
+			runtime.pendingVirtualModelRegistrations.map(({ definition }) => `${definition.provider}/${definition.id}`),
+		).toEqual(["pool:all/gpt-test", "pool:all/claude-test-1", "pool:claude/claude-test-1"]);
 	});
 
 	it("keeps file tools out of the credential directory", async () => {
@@ -386,6 +414,10 @@ describe("accounts extension", () => {
 			guard!({ type: "tool_call", toolCallId: "1", toolName, input: { path } }, { cwd: agentDir } as never);
 		expect(await call("read", join(agentDir, "accounts", "auths", "claude.json"))).toMatchObject({ block: true });
 		expect(await call("write", "accounts/broker.json")).toMatchObject({ block: true });
+		expect(await call("read", join(agentDir, "accounts", "claude-subscriptions.json"))).toMatchObject({
+			block: true,
+		});
+		expect(await call("edit", "accounts/claude-subscriptions.json")).toMatchObject({ block: true });
 		expect(await call("read", join(agentDir, "settings.json"))).toBeUndefined();
 	});
 });
@@ -420,7 +452,7 @@ describe("accounts panel command", () => {
 				refresh: async () => {},
 				getAll: () => providerSpecs(testCatalog()).flatMap((entry) => entry.models),
 			},
-			sessionManager: { getEntries: () => [] },
+			sessionManager: { getEntries: () => [], getBranch: () => [] },
 			ui: {
 				select,
 				notify: vi.fn(),
@@ -463,7 +495,7 @@ describe("accounts panel command", () => {
 	it("returns from management to the same selected account", async () => {
 		const result = await runPanel([["\x1b[B", "\x0f"], ["\x1b"]], "Disable");
 		expect(result.panels).toHaveLength(2);
-		expect(result.panels[1].some((line) => line.startsWith("\x1b[7m› Claude · b@example.com"))).toBe(true);
+		expect(result.panels[1].some((line) => line.startsWith("\x1b[7m› Claude · b (API credits)"))).toBe(true);
 		expect(
 			result.broker.requests.some((request) => request.path === `/credne/v1/accounts/${claudeB.key}/disable`),
 		).toBe(true);
@@ -543,18 +575,29 @@ describe("broker client", () => {
 });
 
 describe("account providers", () => {
-	it("pool:all routes Claude and GPT models through one pool URL on their own APIs", async () => {
+	it("a broker pool routes Claude and GPT models through one pool URL on their own APIs", async () => {
 		const broker = await startFakeBroker();
 		const models = createModels();
-		const all = spec("pool:all");
-		models.setProvider(createAccountProvider(all, clientFor(broker.home)));
-		const [claude, gpt] = all.models;
+		const mixed: BrokerProviderSpec = {
+			id: "pool:mixed",
+			name: "Mixed pool",
+			target: { type: "pool", name: "mixed" },
+			family: "mixed",
+			subscription: false,
+			disabled: false,
+			models: [...spec(ACCT_A).models, ...spec(ACCT_C).models].map((model) => ({
+				...model,
+				provider: "pool:mixed",
+			})),
+		};
+		models.setProvider(createAccountProvider(mixed, clientFor(broker.home)));
+		const [claude, gpt] = mixed.models;
 		await models.completeSimple(claude!, { messages: [{ role: "user", content: "a", timestamp: Date.now() }] });
 		await models.completeSimple(gpt!, { messages: [{ role: "user", content: "b", timestamp: Date.now() }] });
 		const paths = broker.requests
 			.filter((request) => request.path.startsWith("/credne/v1/route/"))
 			.map((r) => r.path);
-		expect(paths).toEqual(["/credne/v1/route/p.all/v1/messages?beta=true", "/credne/v1/route/p.all/responses"]);
+		expect(paths).toEqual(["/credne/v1/route/p.mixed/v1/messages?beta=true", "/credne/v1/route/p.mixed/responses"]);
 	});
 
 	it("reports which account served a request", async () => {
@@ -574,7 +617,7 @@ describe("account providers", () => {
 		const broker = await startFakeBroker();
 		const client = clientFor(broker.home);
 		const pinned = createAccountProvider(spec(ACCT_A), client);
-		const pool = createAccountProvider(spec("pool:claude"), client);
+		const pool = createAccountProvider(spec("pool:codex"), client);
 		const signal = new AbortController().signal;
 		const ctx = { env: async () => undefined, fileExists: async () => false };
 		expect(await pinned!.auth.apiKey!.check!({ ctx, signal })).toEqual({ type: "api_key", source: "account broker" });
@@ -584,7 +627,7 @@ describe("account providers", () => {
 			baseUrl: `${broker.url}/credne/v1/route/a.${claudeA.key}`,
 		});
 		const poolAuth = await pool!.auth.apiKey!.resolve({ ctx, signal });
-		expect(poolAuth?.auth.baseUrl).toBe(`${broker.url}/credne/v1/route/p.claude`);
+		expect(poolAuth?.auth.baseUrl).toBe(`${broker.url}/credne/v1/route/p.codex`);
 
 		const disabled = createAccountProvider({ ...spec(ACCT_A), disabled: true }, client);
 		expect(await disabled.auth.apiKey!.check!({ ctx, signal })).toBeUndefined();
@@ -797,9 +840,7 @@ describe("account add flow", () => {
 		const added = requests.find((request) => request.path === "/credne/v1/api-keys")!;
 		expect(added.method).toBe("POST");
 		expect(JSON.parse(added.body)).toEqual({ provider: "claude", name: "work", key: "sk-ant-api03-test" });
-		expect(notifications).toEqual([
-			{ message: expect.stringContaining("Added Claude · a@example.com (max)"), type: "info" },
-		]);
+		expect(notifications).toEqual([{ message: expect.stringContaining("Added Claude · a (API key)"), type: "info" }]);
 	});
 
 	it("offers ChatGPT API keys and subscription sign-in in the second menu", async () => {
@@ -823,15 +864,12 @@ describe("account add flow", () => {
 		]);
 	});
 
-	it.each([
-		{ argument: "claude-subscription", provider: "claude", added: claudeA },
-		{ argument: "codex", provider: "codex", added: codexC },
-	])("/accounts add $argument signs in to $provider without menus", async ({ argument, provider, added }) => {
-		const { menus, requests } = await runAccount(`add ${argument}`, {
-			respond: loginRoutes({ status: "ok", account: added }),
+	it("/accounts add codex signs in through the broker without menus", async () => {
+		const { menus, requests } = await runAccount("add codex", {
+			respond: loginRoutes({ status: "ok", account: codexC }),
 		});
 		expect(menus).toEqual([]);
-		expect(loginRequest(requests)?.provider).toBe(provider);
+		expect(loginRequest(requests)?.provider).toBe("codex");
 	});
 
 	it("/accounts add claude opens the Claude menu directly", async () => {
@@ -886,22 +924,22 @@ describe("account add flow", () => {
 		},
 		{
 			name: "startLogin",
-			args: "add claude-subscription",
+			args: "add codex",
 			choices: [],
 			answers: [],
 			respond: (request: RecordedRequest): FakeResponse | undefined =>
 				request.path === "/credne/v1/logins"
-					? { status: 409, body: { error: "This Claude account is already added as a@example.com." } }
+					? { status: 409, body: { error: "This ChatGPT account is already added as a@example.com." } }
 					: undefined,
-			message: "Account broker: This Claude account is already added as a@example.com.",
+			message: "Account broker: This ChatGPT account is already added as a@example.com.",
 		},
 		{
 			name: "loginStatus",
-			args: "add claude-subscription",
+			args: "add codex",
 			choices: [],
 			answers: [],
-			respond: loginRoutes({ status: "error", error: "This Claude account is already added as a@example.com." }),
-			message: "This Claude account is already added as a@example.com.",
+			respond: loginRoutes({ status: "error", error: "This ChatGPT account is already added as a@example.com." }),
+			message: "This ChatGPT account is already added as a@example.com.",
 		},
 	])("shows a duplicate from $name as one error", async ({ args, choices, answers, respond, message }) => {
 		const { notifications } = await runAccount(args, { choices, answers, respond });

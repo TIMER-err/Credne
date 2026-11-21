@@ -11,6 +11,7 @@ import {
 	type TuiMouseEvent,
 } from "@earendil-works/pi-tui";
 import type { ToolDefinition, ToolRenderContext, ToolRenderers } from "../../../core/extensions/types.ts";
+import { HIDDEN_CONTEXT_LABEL, isProviderFailureReport } from "../../../core/messages.ts";
 
 /** What this component needs from a tool: how to draw it, without executing it. */
 export type { ToolRenderers };
@@ -280,6 +281,7 @@ export class ToolExecutionComponent extends Container {
 
 	private updateDisplay(): void {
 		this.argsPending = false;
+		const hidden = !this.isPartial && this.toolName === "subagent" && isProviderFailureReport(this.result?.details);
 		const bgFn = this.isPartial
 			? (text: string) => theme.bg("toolPendingBg", text)
 			: this.result?.isError
@@ -342,10 +344,13 @@ export class ToolExecutionComponent extends Container {
 					}
 				}
 			}
+			if (hidden) renderContainer.addChild(new Text(theme.fg("muted", HIDDEN_CONTEXT_LABEL), 0, 0));
 		} else {
 			this.contentText.setCustomBgFn(bgFn);
 			this.contentText.setPaddingX(this.outputPad);
-			this.contentText.setText(this.formatToolExecution());
+			this.contentText.setText(
+				this.formatToolExecution() + (hidden ? `\n${theme.fg("muted", HIDDEN_CONTEXT_LABEL)}` : ""),
+			);
 			hasContent = true;
 		}
 

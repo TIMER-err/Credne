@@ -477,6 +477,141 @@ describe("SidePanel diff", () => {
 	});
 });
 
+describe("SidePanel mouse hover", () => {
+	function mouse(
+		type: TuiMouseEvent["type"],
+		x: number,
+		y: number,
+		overrides: Partial<TuiMouseEvent> = {},
+	): TuiMouseEvent {
+		return {
+			type,
+			button: type === "move" || type === "leave" ? "none" : "left",
+			x,
+			y,
+			screenX: x,
+			screenY: y,
+			width: 60,
+			height: 30,
+			shift: false,
+			alt: false,
+			ctrl: false,
+			...overrides,
+		};
+	}
+
+	it("contrasts hovered files, including the selected file, without changing selection", () => {
+		const panel = createPanel();
+		panel.setChanges(ready([file("a.ts", 1, 0), file("b.ts", 1, 0)]));
+		const initial = panel.render(60);
+
+		expect(panel.handleMouse(mouse("move", 5, 3))).toEqual({ handled: true, render: true });
+		const hovered = panel.render(60);
+		expect(hovered[2]).toBe(initial[2]);
+		expect(hovered[3]).toContain("\x1b[7m");
+		expect(hovered[3]).toContain(theme.getBgAnsi("selectedBg"));
+		expect(hovered.map(visibleWidth)).toEqual(Array(30).fill(60));
+		expect(panel.getSelectedFile()?.path).toBe("a.ts");
+
+		expect(panel.handleMouse(mouse("move", 55, 3))).toEqual({ handled: true, render: false });
+		expect(panel.render(60)).toBe(hovered);
+
+		panel.handleMouse(mouse("move", 5, 2));
+		const selectedHover = panel.render(60);
+		expect(selectedHover[2]).not.toBe(initial[2]);
+		expect(selectedHover[2]).toContain("\x1b[7m");
+		expect(selectedHover[3]).toBe(initial[3]);
+		expect(panel.getSelectedFile()?.path).toBe("a.ts");
+
+		expect(panel.handleMouse(mouse("leave", -1, 2))).toEqual({ handled: true, render: true });
+		expect(panel.render(60)).toEqual(initial);
+		expect(panel.handleMouse(mouse("leave", -1, 2))).toBeUndefined();
+	});
+
+	it("clears file hover over non-file rows and keeps the render cached afterwards", () => {
+		const panel = createPanel();
+		panel.setChanges(ready([file("a.ts", 1, 0)]));
+		const initial = panel.render(60);
+		panel.handleMouse(mouse("move", 5, 2));
+		panel.render(60);
+
+		expect(panel.handleMouse(mouse("move", 5, 1))).toEqual({ handled: true, render: true });
+		const cleared = panel.render(60);
+		expect(cleared).toEqual(initial);
+		expect(panel.handleMouse(mouse("move", 20, 1))).toBeUndefined();
+		expect(panel.render(60)).toBe(cleared);
+	});
+
+	it("keeps hover on the screen row when the file index scrolls", () => {
+		const panel = createPanel(24);
+		panel.setChanges(ready(Array.from({ length: 20 }, (_, index) => file(`file${index}.txt`, 1, 0))));
+		panel.render(60);
+		panel.handleMouse(mouse("move", 5, 3));
+		expect(stripAnsi(panel.render(60)[3]!)).toContain("file0.txt");
+
+		panel.handleMouse(mouse("wheel", 5, 3, { wheelDelta: 8 }));
+		const scrolled = panel.render(60);
+		expect(stripAnsi(scrolled[3]!)).toContain("file8.txt");
+		expect(scrolled[3]).toContain("\x1b[7m");
+		expect(scrolled[4]).not.toContain("\x1b[7m");
+		expect(panel.getSelectedFile()?.path).toBe("file0.txt");
+	});
+
+	it("highlights the separator across sections, changes and blank rows, then clears on leave", () => {
+		const panel = new SidePanel({ getHeight: () => 30, getCloseHint: () => "/diff", resize: () => {} });
+		panel.setSections([{ key: "section", order: 0, component: section(["extension"]) }]);
+		panel.setChanges(ready([file("a.ts", 1, 0)]));
+		const initial = panel.render(60);
+		const border = theme.fg("borderAccent", "│");
+		const activeBorder = theme.inverse(theme.fg("borderAccent", "┃"));
+
+		expect(panel.handleMouse(mouse("move", 0, 3))).toEqual({ handled: true, render: true });
+		const hovered = panel.render(60);
+		expect(hovered.every((line) => line.startsWith(activeBorder))).toBe(true);
+		expect(hovered.map((line) => line.slice(activeBorder.length))).toEqual(
+			initial.map((line) => line.slice(border.length)),
+		);
+		expect(hovered.map(visibleWidth)).toEqual(Array(30).fill(60));
+		expect(panel.handleMouse(mouse("move", 0, 20))).toEqual({ handled: true, render: false });
+		expect(panel.render(60)).toBe(hovered);
+
+		panel.handleMouse(mouse("leave", -1, 20));
+		expect(panel.render(60)).toEqual(initial);
+	});
+
+	it("keeps the separator highlighted during a captured resize outside the panel", () => {
+		const resized: number[] = [];
+		const panel = new SidePanel({
+			getHeight: () => 30,
+			getCloseHint: () => "/diff",
+			resize: (screenX) => resized.push(screenX),
+		});
+		panel.setChanges(ready([file("a.ts", 1, 0)]));
+		const initial = panel.render(60);
+
+		expect(panel.handleMouse(mouse("press", 0, 2))).toEqual({ handled: true, capture: true, render: true });
+		const pressed = panel.render(60);
+		expect(pressed.every((line) => stripAnsi(line).startsWith("┃"))).toBe(true);
+		panel.handleMouse(mouse("leave", -10, 2));
+		panel.handleMouse(mouse("drag", -10, 2, { screenX: 90 }));
+		expect(panel.render(60)).toBe(pressed);
+		expect(resized).toEqual([90]);
+
+		panel.handleMouse(mouse("release", -10, 2, { screenX: 90 }));
+		expect(resized).toEqual([90, 90]);
+		expect(panel.render(60)).toEqual(initial);
+	});
+
+	it("does not advertise a separator that cannot be resized", () => {
+		const panel = createPanel();
+		panel.setChanges(ready([file("a.ts", 1, 0)]));
+		const initial = panel.render(60);
+
+		expect(panel.handleMouse(mouse("move", 0, 2))).toBeUndefined();
+		expect(panel.render(60)).toBe(initial);
+	});
+});
+
 describe("SidePanel multi-file viewports", () => {
 	function mouse(panel: SidePanel, row: number, type: "wheel" | "click", delta = 1) {
 		return panel.handleMouse({

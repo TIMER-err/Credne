@@ -21,6 +21,11 @@ export interface AuthResolutionOverrides {
 	env?: ProviderEnv;
 	/** Require this much remaining OAuth-token validity; defaults to five minutes. */
 	minOAuthValidityMs?: number;
+	/**
+	 * Access token a provider rejected (HTTP 401 or 403). A stored OAuth credential whose access token still is that
+	 * one is refreshed before it expires; one whose access token changed was refreshed meanwhile and is used as it is.
+	 */
+	rejectedAccessToken?: string;
 	signal?: AbortSignal;
 }
 
@@ -77,6 +82,7 @@ async function resolveProviderAuthWithSignal(
 				stored,
 				signal,
 				overrides?.minOAuthValidityMs,
+				overrides?.rejectedAccessToken,
 			);
 		}
 		if (stored.type === "api_key" && provider.auth.apiKey) {
@@ -165,14 +171,17 @@ async function resolveStoredOAuth(
 	stored: OAuthCredential,
 	signal: AbortSignal,
 	minOAuthValidityMs?: number,
+	rejectedAccessToken?: string,
 ): Promise<AuthResult | undefined> {
 	const minimumValidityMs = Math.max(DEFAULT_OAUTH_MINIMUM_VALIDITY_MS, minOAuthValidityMs ?? 0);
 	const expiresSoon = (credential: OAuthCredential) => Date.now() + minimumValidityMs >= credential.expires;
+	const needsRefresh = (credential: OAuthCredential) =>
+		expiresSoon(credential) || (rejectedAccessToken !== undefined && credential.access === rejectedAccessToken);
 	let credential = stored;
 
-	if (expiresSoon(credential)) {
-		// Optimistic check said expired; the authoritative check runs under the lock.
-		const post = await refreshStoredOAuthCredential(credentials, providerId, oauth, expiresSoon, signal);
+	if (needsRefresh(credential)) {
+		// Optimistic check said expired or rejected; the authoritative check runs under the lock.
+		const post = await refreshStoredOAuthCredential(credentials, providerId, oauth, needsRefresh, signal);
 		if (!post) return undefined; // logged out meanwhile
 		credential = post;
 		// The normal five-minute window triggers a refresh but does not impose a
@@ -184,7 +193,9 @@ async function resolveStoredOAuth(
 	}
 
 	try {
-		return { auth: await oauth.toAuth(credential), source: "OAuth" };
+		const auth = await oauth.toAuth(credential);
+		const env = await oauth.toEnv?.(credential);
+		return { auth, ...(env ? { env } : {}), source: "OAuth" };
 	} catch (error) {
 		throw new ModelsError("oauth", `OAuth auth derivation failed for ${providerId}`, { cause: error });
 	}

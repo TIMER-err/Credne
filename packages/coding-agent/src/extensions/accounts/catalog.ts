@@ -5,10 +5,38 @@ import type { BrokerAccount, BrokerAccountKind, BrokerModel } from "./client.ts"
 
 /** Prefix of providers that pin one broker account. */
 export const ACCOUNT_PROVIDER_PREFIX = "acct:";
+/** Prefix of the providers that serve one local Claude subscription, `claude-sub:<id>`. */
+export const LOCAL_CLAUDE_PROVIDER_PREFIX = "claude-sub:";
 /** Prefix of providers that let the broker balance requests across accounts. */
 export const POOL_PROVIDER_PREFIX = "pool:";
 /** Pool over every account of every family; the default for new sessions. */
 export const ALL_POOL = "all";
+/** Pools that virtual models serve in this process instead of the broker: subscriptions first, then API accounts. */
+export const VIRTUAL_POOLS: readonly string[] = [ALL_POOL, "claude"];
+
+/** Whether `providerId` is a physical provider of one local Claude subscription. */
+export function isLocalClaudeProvider(providerId: string): boolean {
+	return providerId.startsWith(LOCAL_CLAUDE_PROVIDER_PREFIX);
+}
+
+/** Pi provider id of a local Claude subscription. */
+export function localClaudeProviderId(accountId: string): string {
+	return `${LOCAL_CLAUDE_PROVIDER_PREFIX}${accountId}`;
+}
+
+/** Whether `providerId` is a virtual pool (`pool:claude`, `pool:all`): its models route to physical accounts in this process. */
+export function isVirtualPoolProvider(providerId: string): boolean {
+	return (
+		providerId.startsWith(POOL_PROVIDER_PREFIX) &&
+		VIRTUAL_POOLS.includes(providerId.slice(POOL_PROVIDER_PREFIX.length))
+	);
+}
+
+/** Whether requests of `providerId` go through the account broker: a pinned broker account or a broker pool. */
+export function isBrokerProvider(providerId: string): boolean {
+	if (providerId.startsWith(ACCOUNT_PROVIDER_PREFIX)) return true;
+	return providerId.startsWith(POOL_PROVIDER_PREFIX) && !isVirtualPoolProvider(providerId);
+}
 
 /**
  * Placeholder model base URL. The real route URL contains the broker's per-run port, so provider
@@ -29,7 +57,7 @@ export interface CachedAccount {
 	models: Model<Api>[];
 }
 
-/** A pool: every enabled account of its families funds its models. */
+/** A broker pool: every enabled account of its family funds its models. */
 export interface CachedPool {
 	/** `all` or a model family such as `claude`. */
 	name: string;
@@ -49,6 +77,14 @@ export interface AccountCatalog {
 
 export const EMPTY_CATALOG: AccountCatalog = { version: 2, accounts: [], pools: [] };
 
+/**
+ * Claude subscriptions are signed in, stored and refreshed by this process (`claude-sub:*` providers). A broker
+ * account of that kind is legacy data that the one-time import moves out of the broker.
+ */
+export function isBrokerClaudeSubscription(account: { provider: string; kind: BrokerAccountKind }): boolean {
+	return account.provider === "claude" && account.kind === "oauth";
+}
+
 /** Catalog file contents, or an empty catalog when the file is missing, outdated or unreadable. */
 export function readCatalog(path: string): AccountCatalog {
 	let data: unknown;
@@ -65,10 +101,18 @@ export function readCatalog(path: string): AccountCatalog {
 	}
 	return {
 		version: 2,
+		// A catalog written before subscriptions moved out of the broker may still list them and their pools.
 		accounts: catalog.accounts.filter(
-			(entry) => typeof entry?.id === "string" && typeof entry.key === "string" && Array.isArray(entry.models),
+			(entry) =>
+				typeof entry?.id === "string" &&
+				typeof entry.key === "string" &&
+				Array.isArray(entry.models) &&
+				!isBrokerClaudeSubscription(entry),
 		),
-		pools: catalog.pools.filter((entry) => typeof entry?.name === "string" && Array.isArray(entry.models)),
+		pools: catalog.pools.filter(
+			(entry) =>
+				typeof entry?.name === "string" && Array.isArray(entry.models) && !VIRTUAL_POOLS.includes(entry.name),
+		),
 	};
 }
 
@@ -144,13 +188,16 @@ export function poolDisplayName(pool: Pick<CachedPool, "name" | "accountCount">)
 
 /**
  * Build the catalog from broker data, describing models with Pi's catalog metadata where it knows
- * them. Every family with an enabled account gets a pool, and `pool:all` spans every family.
+ * them. Every family with an enabled account gets a broker pool, except the virtual pools (`pool:claude`
+ * and `pool:all`), which span these accounts and the local Claude subscriptions. Broker copies of Claude
+ * subscriptions are left out.
  */
 export function buildCatalog(
-	accounts: readonly BrokerAccount[],
+	brokerAccounts: readonly BrokerAccount[],
 	accountModels: ReadonlyMap<string, readonly BrokerModel[]>,
 	lookup: CatalogLookup,
 ): AccountCatalog {
+	const accounts = brokerAccounts.filter((account) => !isBrokerClaudeSubscription(account));
 	const cachedAccounts = accounts.map((account): CachedAccount => {
 		const providerId = accountProviderId(account.id);
 		return {
@@ -169,7 +216,9 @@ export function buildCatalog(
 	});
 
 	const enabled = accounts.filter((account) => !account.disabled);
-	const families = [...new Set(enabled.map((account) => familyOf(account.provider)))].sort();
+	const families = [...new Set(enabled.map((account) => familyOf(account.provider)))]
+		.filter((family) => !VIRTUAL_POOLS.includes(family))
+		.sort();
 	const poolFor = (name: string, members: readonly BrokerAccount[]): CachedPool => {
 		const models = new Map<string, Model<Api>>();
 		for (const account of members) {
@@ -187,7 +236,6 @@ export function buildCatalog(
 			enabled.filter((account) => familyOf(account.provider) === family),
 		),
 	);
-	if (enabled.length > 0) pools.unshift(poolFor(ALL_POOL, enabled));
 	return { version: 2, accounts: cachedAccounts, pools };
 }
 

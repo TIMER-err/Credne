@@ -1,5 +1,7 @@
 import {
 	type Api,
+	type AssistantMessage,
+	type AssistantMessageEventStream,
 	createProvider,
 	type Model,
 	type Provider,
@@ -15,6 +17,7 @@ import {
 	accountDisplayName,
 	accountProviderId,
 	BROKER_PLACEHOLDER_URL,
+	familyOf,
 	poolDisplayName,
 	poolProviderId,
 } from "./catalog.ts";
@@ -24,35 +27,54 @@ import type { BrokerClient, BrokerTarget } from "./client.ts";
 export const ACCOUNT_HEADER = "x-credne-account";
 
 /** What one Pi provider routes to. */
+export type AccountTarget =
+	| BrokerTarget
+	/** A Claude subscription signed in to this process. */
+	| { type: "local"; id: string }
+	/** A virtual pool: its virtual models route each request to one of the physical accounts. */
+	| { type: "virtual-pool"; name: string };
+
+/** One entry of the account list: a physical provider, or a virtual pool of them. */
 export interface AccountProviderSpec {
 	id: string;
 	name: string;
-	target: BrokerTarget;
+	target: AccountTarget;
+	/** Model family of the account, or the pool's name. */
+	family: string;
+	/** Whether the account is a subscription; routing uses subscriptions before API accounts. */
+	subscription: boolean;
 	/** Disabled accounts stay registered so sessions that used them fail with a clear reason. */
 	disabled: boolean;
 	models: Model<Api>[];
 }
 
+/** A spec the broker serves. */
+export type BrokerProviderSpec = AccountProviderSpec & { target: BrokerTarget };
+
 /** Called with the account key that served a request of a provider. */
 export type ServedByListener = (providerId: string, accountKey: string) => void;
 
-/** One spec per cached pool and account; pools first, `pool:all` leading. */
-export function providerSpecs(catalog: AccountCatalog): AccountProviderSpec[] {
+/** One spec per cached broker pool and account; the virtual pools and local subscriptions are not the broker's. */
+export function providerSpecs(catalog: AccountCatalog): BrokerProviderSpec[] {
 	return [
 		...catalog.pools.map(
-			(pool): AccountProviderSpec => ({
+			(pool): BrokerProviderSpec => ({
 				id: poolProviderId(pool.name),
 				name: poolDisplayName(pool),
 				target: { type: "pool", name: pool.name },
+				family: pool.name,
+				subscription: false,
 				disabled: false,
 				models: pool.models,
 			}),
 		),
 		...catalog.accounts.map(
-			(account): AccountProviderSpec => ({
+			(account): BrokerProviderSpec => ({
 				id: accountProviderId(account.id),
 				name: accountDisplayName(account),
 				target: { type: "account", key: account.key },
+				family: familyOf(account.provider),
+				subscription: account.kind === "oauth",
 				disabled: account.disabled,
 				models: account.models,
 			}),
@@ -66,7 +88,7 @@ export function providerSpecs(catalog: AccountCatalog): AccountProviderSpec[] {
  * credential differ. The credential is the broker's per-run token, never a provider secret.
  */
 export function createAccountProvider(
-	spec: AccountProviderSpec,
+	spec: BrokerProviderSpec,
 	client: BrokerClient,
 	onServedBy?: ServedByListener,
 ): Provider {
@@ -74,6 +96,7 @@ export function createAccountProvider(
 		const key = response.headers[ACCOUNT_HEADER];
 		if (key) onServedBy?.(spec.id, key);
 	};
+	const observer: StreamObserver = { response: report };
 	return createProvider({
 		id: spec.id,
 		name: spec.name,
@@ -96,25 +119,37 @@ export function createAccountProvider(
 		models: spec.models,
 		// A pool may mix APIs (Claude and GPT models), so every adapter is available.
 		api: {
-			"anthropic-messages": observed(anthropicMessagesApi(), report),
-			"openai-responses": observed(openAIResponsesApi(), report),
-			"openai-completions": observed(openAICompletionsApi(), report),
+			"anthropic-messages": observed(anthropicMessagesApi(), observer),
+			"openai-responses": observed(openAIResponsesApi(), observer),
+			"openai-completions": observed(openAICompletionsApi(), observer),
 		},
 	});
 }
 
-/** Wraps an adapter so each HTTP response is reported before the caller's own onResponse runs. */
-function observed(streams: ProviderStreams, report: (response: ProviderResponse) => void): ProviderStreams {
+/** What an observed adapter reports about its requests. */
+export interface StreamObserver {
+	/** Called with each HTTP response before the caller's own onResponse runs. */
+	response?: (response: ProviderResponse, model: Model<Api>) => void;
+	/** Called with the final message of each request, including failed ones. */
+	result?: (message: AssistantMessage) => void;
+}
+
+/** Wraps an adapter so its responses and final messages are reported to `observer`. */
+export function observed(streams: ProviderStreams, observer: StreamObserver): ProviderStreams {
 	const withReport = <T extends StreamOptions>(options: T | undefined): T =>
 		({
 			...options,
 			onResponse: (response: ProviderResponse, model: Model<Api>) => {
-				report(response);
+				observer.response?.(response, model);
 				return options?.onResponse?.(response, model);
 			},
 		}) as T;
+	const watched = (stream: AssistantMessageEventStream): AssistantMessageEventStream => {
+		if (observer.result) void stream.result().then(observer.result, () => {});
+		return stream;
+	};
 	return {
-		stream: (model, context, options) => streams.stream(model, context, withReport(options)),
-		streamSimple: (model, context, options) => streams.streamSimple(model, context, withReport(options)),
+		stream: (model, context, options) => watched(streams.stream(model, context, withReport(options))),
+		streamSimple: (model, context, options) => watched(streams.streamSimple(model, context, withReport(options))),
 	};
 }

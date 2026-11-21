@@ -18,7 +18,8 @@ export interface AccountPanelEntry {
 	id: string;
 	name: string;
 	state: string;
-	accountKey?: string;
+	/** An individual account, which has its own usage and can be managed; a pool is not. */
+	account: boolean;
 	disabled: boolean;
 	costs: SessionAccountCosts;
 }
@@ -32,7 +33,7 @@ interface AccountPanelOptions {
 	entries: readonly AccountPanelEntry[];
 	currentId?: string;
 	selectedId?: string;
-	usage: (key: string, signal: AbortSignal) => Promise<BrokerUsage>;
+	usage: (providerId: string, signal: AbortSignal) => Promise<BrokerUsage>;
 }
 
 type PanelRow = { id: string; label: string; entry?: AccountPanelEntry };
@@ -127,7 +128,7 @@ export class AccountsPanel implements Component, Focusable {
 		else if (matches("tui.select.up")) this.select(Math.max(0, this.selectedIndex - 1));
 		else if (matches("tui.select.down")) this.select(Math.min(this.rows.length - 1, this.selectedIndex + 1));
 		else if (matches("tui.select.confirm")) this.activate();
-		else if (matches("app.accounts.manage") && this.rows[this.selectedIndex].entry?.accountKey) this.finish("manage");
+		else if (matches("app.accounts.manage") && this.rows[this.selectedIndex].entry?.account) this.finish("manage");
 		else if (matches("app.accounts.model") && this.rows[this.selectedIndex].entry) this.finish("model");
 		else if (matches("app.accounts.refresh")) this.loadUsage();
 		else if (matches("tui.select.pageUp")) this.detailOffset = Math.max(0, this.detailOffset - this.detailPageSize);
@@ -178,11 +179,11 @@ export class AccountsPanel implements Component, Focusable {
 	private loadUsage(): void {
 		this.request?.abort();
 		this.usage = undefined;
-		const key = this.rows[this.selectedIndex].entry?.accountKey;
-		if (!key) return;
+		const entry = this.rows[this.selectedIndex].entry;
+		if (!entry?.account) return;
 		const request = new AbortController();
 		this.request = request;
-		void this.options.usage(key, request.signal).then(
+		void this.options.usage(entry.id, request.signal).then(
 			(usage) => {
 				if (request.signal.aborted || this.closed) return;
 				this.usage = usage;
@@ -207,7 +208,7 @@ export class AccountsPanel implements Component, Focusable {
 			];
 		const theme = this.theme;
 		const lines = ["", theme.bold(entry.name), theme.fg("muted", entry.state)];
-		if (!entry.accountKey)
+		if (!entry.account)
 			lines.push(
 				"",
 				theme.fg("muted", "Pool quotas belong to individual accounts; browse an account to see its limits."),
@@ -231,10 +232,10 @@ export class AccountsPanel implements Component, Focusable {
 			theme.bold("This session"),
 			theme.fg("dim", "Recorded API-rate cost estimates (USD); not billed subscription charges or quota."),
 		);
-		if (entry.accountKey) {
+		if (entry.account) {
 			lines.push(...this.costLines(entry.costs.account, entry.costs.accountResponses, "Selected pinned account"));
 		}
-		if (!entry.accountKey || entry.costs.poolResponses) {
+		if (!entry.account || entry.costs.poolResponses) {
 			lines.push(
 				...this.costLines(
 					entry.costs.unattributedPools,

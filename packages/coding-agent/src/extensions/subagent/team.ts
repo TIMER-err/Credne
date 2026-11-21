@@ -8,6 +8,12 @@ import { SUBAGENT_USAGE_ENTRY, type SubagentUsageSnapshot } from "../../core/ses
 import type { UsageTotals } from "../../core/usage-totals.ts";
 import type { ThemeColor } from "../../modes/interactive/theme/theme-tokens.ts";
 import { type BackgroundJob, BackgroundJobManager } from "./background-job-manager.ts";
+import {
+	type DispatchResolution,
+	type DispatchSelection,
+	reasoningEffortSchema,
+	type SubagentDispatch,
+} from "./dispatch.ts";
 import { PrefixWarmup } from "./prefix-warmup.ts";
 import {
 	aggregateUsage,
@@ -49,14 +55,15 @@ export interface WorkerSummary {
 	status: "queued" | "running" | "completed" | "failed" | "interrupted" | "cancelled";
 	inboxCount: number;
 	assignmentCount: number;
+	model?: string;
+	reasoningEffort?: ThinkingLevel;
 }
 
 export interface WorkerView extends WorkerSummary {
 	/** Stable for the life of the team; assigned in spawn order. */
 	color: ThemeColor;
 	agentType: string;
-	model?: string;
-	reasoningEffort?: ThinkingLevel;
+	cwd: string;
 	usage: UsageStats;
 	elapsedMs: number;
 	runs: SingleResult[];
@@ -75,6 +82,7 @@ interface Worker {
 	assignments: WorkerRun[];
 	run?: WorkerRun;
 	cancellation?: Promise<void>;
+	modelChange?: Promise<DispatchResolution>;
 	hasStarted: boolean;
 	runs: SingleResult[];
 	elapsedMs: number;
@@ -181,11 +189,12 @@ export class WorkerTeam {
 	spawn(input: SpawnInput): { id: string; result: Promise<SingleResult> } {
 		this.assertActive();
 		const id = randomUUID();
+		const defaults = { ...input.defaults };
 		const worker: Worker = {
 			id,
 			// Workers are never removed from the map, so its size is the spawn order.
 			color: workerColorAt(this.workers.size),
-			input,
+			input: { ...input, defaults },
 			status: "queued",
 			inbox: [],
 			assignments: [],
@@ -193,7 +202,7 @@ export class WorkerTeam {
 			runs: [],
 			elapsedMs: 0,
 			session: createWorkerSession(
-				input.defaults,
+				defaults,
 				input.resolved,
 				input.name,
 				{
@@ -230,6 +239,8 @@ export class WorkerTeam {
 			status: worker.status,
 			inboxCount: worker.inbox.length,
 			assignmentCount: worker.assignments.length,
+			model: worker.input.defaults.model ?? worker.input.resolved.agent?.model,
+			reasoningEffort: worker.input.defaults.thinkingLevel,
 		}));
 	}
 
@@ -254,8 +265,8 @@ export class WorkerTeam {
 				...summary,
 				color: worker.color,
 				agentType: worker.input.resolved.agent?.name ?? worker.input.name,
-				model: latest?.model ?? worker.input.defaults.model ?? worker.input.resolved.agent?.model,
-				reasoningEffort: worker.input.defaults.thinkingLevel,
+				cwd: worker.input.resolved.cwd,
+				model: summary.model ?? latest?.model,
 				usage: {
 					...aggregateUsage(worker.runs),
 					contextTokens: latest?.usage.contextTokens ?? 0,
@@ -327,6 +338,44 @@ export class WorkerTeam {
 		worker.input.beforeResume?.();
 		this.enqueue(worker, prompt);
 		return worker.status;
+	}
+
+	/** Changes an idle worker's model and effort without replacing its retained conversation. */
+	async changeModel(
+		id: string,
+		selection: DispatchSelection,
+		dispatch: SubagentDispatch,
+		ctx: ExtensionContext,
+	): Promise<DispatchResolution> {
+		this.assertActive();
+		const worker = this.getWorker(id);
+		if (worker.status === "cancelled") throw new Error(`Worker ${id} is cancelled; spawn a new worker instead.`);
+		if (worker.run)
+			throw new Error(
+				`Worker ${id} is active. Call interrupt_agent and wait for it to finish before change_agent_model.`,
+			);
+		if (worker.modelChange)
+			throw new Error(`Worker ${id} already has a model change in progress. Wait for it to finish.`);
+		const configuration = dispatch.resolve(selection, {
+			...ctx,
+			thinkingLevel: worker.input.defaults.thinkingLevel ?? ctx.thinkingLevel,
+		});
+		const model = ctx.modelRegistry
+			.getAvailable()
+			.find((candidate) => `${candidate.provider}/${candidate.id}` === configuration.model)!;
+		worker.modelChange = (async () => {
+			try {
+				await worker.session.setModel(model, configuration.thinkingLevel);
+				return configuration;
+			} finally {
+				this.notify();
+			}
+		})();
+		try {
+			return await worker.modelChange;
+		} finally {
+			worker.modelChange = undefined;
+		}
 	}
 
 	/** Adds an instruction to the active run without interrupting it. */
@@ -472,6 +521,8 @@ export class WorkerTeam {
 
 	private async execute(run: WorkerRun, signal: AbortSignal): Promise<SingleResult> {
 		const { worker } = run;
+		if (worker.modelChange) await worker.modelChange;
+		if (signal.aborted) return this.emptyResult(worker, run.task, "aborted", "Worker run interrupted");
 		worker.status = "running";
 		worker.startedAt = Date.now();
 		this.notify();
@@ -602,11 +653,45 @@ export class WorkerTeam {
 }
 
 /**
+ * Tools whose declarations main leaves out of requests until its first delegation: worker
+ * coordination, model discovery and context checkpoints. They stay active and callable meanwhile.
+ */
+export const DELEGATION_TOOLS = [
+	"list_agents",
+	"send_agent_message",
+	"interrupt_agent",
+	"continue_agent",
+	"steer_agent",
+	"change_agent_model",
+	"search_models",
+	"get_subagent_context",
+	"checkpoint_context",
+];
+
+/**
+ * Re-runs the `prepareLoadout` hooks, so tools a hook stopped hiding are declared from the model's
+ * next call, and lists the active ones among `names` for the tool result that revealed them.
+ */
+export function revealTools(pi: ExtensionAPI, names: readonly string[]): string | undefined {
+	const active = pi.getActiveTools();
+	pi.setActiveTools(active);
+	const lines = pi
+		.getAllTools()
+		.filter((tool) => names.includes(tool.name) && active.includes(tool.name))
+		.map((tool) => `- ${tool.name}: ${tool.description.trim().split(/\r?\n/)[0]}`);
+	return lines.length > 0 ? `These tools are declared from your next call:\n${lines.join("\n")}` : undefined;
+}
+
+/**
  * Registers the coordination tools once for an extension API. In a worker, listing and messaging
  * go to main's coordinator through `requestParent`, and the controls that only main may use are
  * not registered.
  */
-export function registerTeamTools(pi: ExtensionAPI, requestParent: RequestParent | undefined): void {
+export function registerTeamTools(
+	pi: ExtensionAPI,
+	requestParent: RequestParent | undefined,
+	dispatch: SubagentDispatch,
+): void {
 	if (registeredTools.has(pi)) return;
 	registeredTools.add(pi);
 
@@ -614,7 +699,7 @@ export function registerTeamTools(pi: ExtensionAPI, requestParent: RequestParent
 		name: "list_agents",
 		label: "List agents",
 		description:
-			"List the workers of the current parent session with their IDs and states. Called by a worker, the list also names main.",
+			"List the workers of the current parent session with their IDs, states, current models, and reasoning efforts. Called by a worker, the list also names main.",
 		parameters: Type.Object({}),
 		async execute(_id, _params, signal, _update, ctx) {
 			const agents = requestParent ? await requestParent({ type: "list" }, signal) : getWorkerTeam(pi, ctx).list();
@@ -636,6 +721,27 @@ export function registerTeamTools(pi: ExtensionAPI, requestParent: RequestParent
 		},
 	});
 	if (requestParent) return;
+	pi.registerTool({
+		name: "change_agent_model",
+		label: "Change agent model",
+		description:
+			"Change an idle or interrupted worker's model and optional reasoning effort, retaining its conversation and pending messages. Does not resume the worker. For active or queued workers, call interrupt_agent and wait first, then change_agent_model, then continue_agent. Use search_models to select an available model; an explicit provider/model ID changes routes. Omitted effort preserves the worker's current effort, clamped to the new model's supported levels.",
+		executionMode: "sequential",
+		parameters: Type.Object({
+			agentId: Type.String({ minLength: 1 }),
+			model: Type.String({ minLength: 1 }),
+			reasoningEffort: Type.Optional(reasoningEffortSchema),
+		}),
+		async execute(_id, params, _signal, _update, ctx) {
+			const configuration = await getWorkerTeam(pi, ctx).changeModel(params.agentId, params, dispatch, ctx);
+			const details = {
+				agentId: params.agentId,
+				model: configuration.model,
+				reasoningEffort: configuration.thinkingLevel,
+			};
+			return { content: [{ type: "text", text: JSON.stringify(details) }], details };
+		},
+	});
 	pi.registerTool({
 		name: "interrupt_agent",
 		label: "Interrupt agent",

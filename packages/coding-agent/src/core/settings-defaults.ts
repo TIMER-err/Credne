@@ -1,5 +1,8 @@
 import { DEFAULT_MAX_AGENT_RETRY_DELAY_MS } from "@earendil-works/pi-ai/utils/retry";
 
+/** A numeric percentage from 1% inclusive to 100% exclusive. */
+export const SIDE_PANEL_WIDTH_PERCENT_PATTERN = "^[1-9][0-9]?(?:\\.[0-9]+)?%$";
+
 /** Runtime defaults shared by settings accessors and the published JSON Schema. */
 export const SETTINGS_DEFAULTS = {
 	transport: "auto",
@@ -59,6 +62,10 @@ export const SETTINGS_DEFAULTS = {
 		inlineBudget: 3000,
 	},
 	cacheWarming: "idle",
+	sidePanel: {
+		enabled: false,
+		widthPercent: 40,
+	},
 	tuiMode: "fullscreen",
 	fullscreenExitOutput: "transcript",
 	fullscreenScrollbar: "auto",

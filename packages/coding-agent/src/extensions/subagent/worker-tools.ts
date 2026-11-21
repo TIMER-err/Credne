@@ -7,6 +7,7 @@ const mainOnlyTools = new Set([
 	"steer_agent",
 	"interrupt_agent",
 	"continue_agent",
+	"change_agent_model",
 	"enter_plan_mode",
 	"create_plan",
 	"task_create",
